@@ -149,6 +149,17 @@ class SMAQKVCache:
         self.value_scales: Optional[mx.array] = None
         self.value_zeros: Optional[mx.array] = None
 
+        # Linear attention state (for Qwen3.5 hybrid architecture)
+        self._linear_attn_state: list = [None, None]
+
+    def __getitem__(self, idx):
+        """Support cache[0], cache[1] for linear_attn layers (Qwen3.5)."""
+        return self._linear_attn_state[idx]
+
+    def __setitem__(self, idx, value):
+        """Support cache[0] = x, cache[1] = y for linear_attn layers."""
+        self._linear_attn_state[idx] = value
+
     def update_and_fetch(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
         """Store KV pairs and return full precision for attention computation.
 
@@ -176,7 +187,16 @@ class SMAQKVCache:
         self.values[..., prev:self.offset, :] = values
 
         # Also quantize for memory tracking
-        new_key_q = self.key_quantizer.quantize(keys)
+        # Reshape from (B, n_kv_heads, T, D) to (B * n_kv_heads * T, D) for quantizer
+        k_shape = keys.shape
+        k_flat = keys.reshape(-1, k_shape[-1])
+        new_key_q = self.key_quantizer.quantize(k_flat)
+        # Reshape indices back to (B, n_kv_heads, T, packed_D)
+        new_key_q = SMAQQuantized(
+            indices=new_key_q.indices.reshape(k_shape[0], k_shape[1], k_shape[2], new_key_q.indices.shape[-1]),
+            norms=new_key_q.norms.reshape(k_shape[0], k_shape[1], k_shape[2]),
+            bits=new_key_q.bits,
+        )
         new_v_data, new_v_scales, new_v_zeros, _ = quantize_values(
             values, bits=self.value_bits, group_size=self.value_group_size
         )

@@ -30,8 +30,19 @@ def generate(
 ):
     """Generate text using SMAQ KV cache compression."""
     n_layers = len(model.layers)
-    head_dim = model.layers[0].self_attn.head_dim
-    n_kv_heads = model.layers[0].self_attn.n_kv_heads
+
+    # Find head_dim — Qwen3.5 has hybrid layers, self_attn only on some layers
+    head_dim = None
+    n_kv_heads = None
+    for layer in model.layers:
+        if hasattr(layer, 'self_attn'):
+            head_dim = layer.self_attn.head_dim
+            n_kv_heads = layer.self_attn.n_kv_heads if hasattr(layer.self_attn, 'n_kv_heads') else None
+            break
+
+    if head_dim is None:
+        print("ERROR: Could not determine head_dim from model")
+        return
 
     print(f"Model config: head_dim={head_dim}, layers={n_layers}, n_kv_heads={n_kv_heads}")
 
@@ -81,7 +92,7 @@ def generate(
 
 def main():
     parser = argparse.ArgumentParser(description="SMAQ-MLX Demo")
-    parser.add_argument("--model", type=str, default="mlx-community/Llama-3.2-1B-Instruct-4bit")
+    parser.add_argument("--model", type=str, default="mlx-community/Qwen3.5-2B-OptiQ-4bit")
     parser.add_argument("--prompt", type=str, default="Explain quantum computing in simple terms")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temp", type=float, default=0.7)
