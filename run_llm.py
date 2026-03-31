@@ -92,7 +92,7 @@ def generate(
 
 def main():
     parser = argparse.ArgumentParser(description="SMAQ-MLX Demo")
-    parser.add_argument("--model", type=str, default="mlx-community/Qwen3.5-2B-OptiQ-4bit")
+    parser.add_argument("--model", type=str, default="mlx-community/Qwen3.5-4B-MLX-4bit")
     parser.add_argument("--prompt", type=str, default="Explain quantum computing in simple terms")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temp", type=float, default=0.7)
