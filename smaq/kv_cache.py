@@ -7,6 +7,11 @@ Implements the same interface as mlx-lm's KVCache:
   - update_and_fetch(keys, values) -> (keys, values)
   - offset property
   - state property
+
+Design:
+- During prefill: store full keys/values for exact attention, also quantize for tracking
+- During decode: compute attention against quantized keys via custom SDPA
+- The patch.py intercepts SDPA to use quantized attention when possible
 """
 
 import math
@@ -98,10 +103,11 @@ def dequantize_values(
 class SMAQKVCache:
     """Drop-in KV cache with SMAQ-compressed keys + group-quantized values.
 
-    Implements the mlx-lm KVCache interface for seamless integration:
-      - update_and_fetch(keys, values) -> (keys, values)
-      - offset property (used by RoPE)
-      - state property (used by mlx-lm generation)
+    Implements the mlx-lm KVCache interface for seamless integration.
+
+    Storage strategy:
+    - Full precision keys/values stored for exact attention computation
+    - Quantized versions tracked for memory estimation and future SDPA interception
     """
 
     step = 256
@@ -133,54 +139,53 @@ class SMAQKVCache:
         self.offset = 0
         self.seq_len = 0
 
-        # Compressed storage
+        # Full precision storage (for exact attention)
+        self.keys: Optional[mx.array] = None
+        self.values: Optional[mx.array] = None
+
+        # Quantized storage (for memory tracking and future SDPA interception)
         self.key_quantized: Optional[SMAQQuantized] = None
         self.value_data: Optional[mx.array] = None
         self.value_scales: Optional[mx.array] = None
         self.value_zeros: Optional[mx.array] = None
 
-        # Exact buffer for recent tokens
-        self.key_buffer: Optional[mx.array] = None
-        self.value_buffer: Optional[mx.array] = None
-
-        # Full dequantized buffers for drop-in compatibility
-        self._key_dequant: Optional[mx.array] = None
-        self._value_dequant: Optional[mx.array] = None
-
     def update_and_fetch(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
-        """Quantize new KV pairs, store compressed, return dequantized for SDPA.
+        """Store KV pairs and return full precision for attention computation.
 
         This is the main interface called by mlx-lm's attention layers.
-        Keys are SMAQ-quantized, values are group-quantized.
-        Dequantized versions are returned for the attention computation.
+        Keys/values are stored in full precision for exact attention,
+        and also quantized for memory tracking.
         """
         prev = self.offset
         num_steps = keys.shape[2]
         self.offset += num_steps
         self.seq_len = self.offset
 
-        # SMAQ quantize keys
+        # Store full precision keys/values
+        if self.keys is None:
+            # Pre-allocate with step sizing
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            n_steps = (self.step + num_steps - 1) // self.step * self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+            self.keys = mx.zeros(k_shape, keys.dtype)
+            self.values = mx.zeros(v_shape, values.dtype)
+
+        self.keys[..., prev:self.offset, :] = keys
+        self.values[..., prev:self.offset, :] = values
+
+        # Also quantize for memory tracking
         new_key_q = self.key_quantizer.quantize(keys)
-        # Group quantize values
         new_v_data, new_v_scales, new_v_zeros, _ = quantize_values(
             values, bits=self.value_bits, group_size=self.value_group_size
         )
 
-        # Dequantize for return
-        new_k_hat = self.key_quantizer.dequantize(new_key_q)
-        new_v_hat = dequantize_values(
-            new_v_data, new_v_scales, new_v_zeros,
-            self.value_bits, self.value_group_size
-        )
-
-        # Append to compressed storage
         if self.key_quantized is None:
             self.key_quantized = new_key_q
             self.value_data = new_v_data
             self.value_scales = new_v_scales
             self.value_zeros = new_v_zeros
-            self._key_dequant = new_k_hat
-            self._value_dequant = new_v_hat
         else:
             self.key_quantized = SMAQQuantized(
                 indices=mx.concatenate([self.key_quantized.indices, new_key_q.indices], axis=-2),
@@ -190,15 +195,13 @@ class SMAQKVCache:
             self.value_data = mx.concatenate([self.value_data, new_v_data], axis=-2)
             self.value_scales = mx.concatenate([self.value_scales, new_v_scales], axis=-2)
             self.value_zeros = mx.concatenate([self.value_zeros, new_v_zeros], axis=-2)
-            self._key_dequant = mx.concatenate([self._key_dequant, new_k_hat], axis=-2)
-            self._value_dequant = mx.concatenate([self._value_dequant, new_v_hat], axis=-2)
 
-        return self._key_dequant, self._value_dequant
+        return self.keys[..., :self.offset, :], self.values[..., :self.offset, :]
 
     @property
     def state(self):
         """Return state for mlx-lm compatibility."""
-        return [self._key_dequant, self._value_dequant] if self._key_dequant is not None else []
+        return [self.keys, self.values] if self.keys is not None else []
 
     @state.setter
     def state(self, v):
@@ -218,13 +221,14 @@ class SMAQKVCache:
     def trim(self, n):
         n = min(self.offset, n)
         self.offset -= n
-        if self._key_dequant is not None:
-            self._key_dequant = self._key_dequant[..., :self.offset, :]
-            self._value_dequant = self._value_dequant[..., :self.offset, :]
+        self.seq_len = self.offset
+        if self.keys is not None:
+            self.keys = self.keys[..., :self.offset + (self.keys.shape[2] - self.offset), :]
+            self.values = self.values[..., :self.offset + (self.values.shape[2] - self.offset), :]
         return n
 
     def empty(self):
-        return self.key_quantized is None
+        return self.keys is None
 
     def prefill(self, keys: mx.array, values: mx.array):
         """Capture a full prefill segment (legacy interface)."""
@@ -244,13 +248,9 @@ class SMAQKVCache:
 
     def attend(self, attn_weights: mx.array) -> mx.array:
         """Apply attention weights to compressed values."""
-        if self.value_data is None:
+        if self.values is None:
             return mx.zeros((*attn_weights.shape[:-1], self.head_dim))
-        v_dequant = dequantize_values(
-            self.value_data, self.value_scales, self.value_zeros,
-            self.value_bits, self.value_group_size
-        )
-        return (attn_weights.astype(mx.float32) @ v_dequant)
+        return (attn_weights.astype(mx.float32) @ self.values.astype(mx.float32))
 
     def memory_bytes(self) -> dict[str, int]:
         """Estimate memory usage of the cache."""
@@ -267,6 +267,26 @@ class SMAQKVCache:
 
         info["total"] = info["quantized_keys"] + info["quantized_values"]
         return info
+
+    @property
+    def nbytes(self):
+        """Memory usage in bytes (for compatibility with mlx-lm)."""
+        total = 0
+        if self.keys is not None:
+            total += self.keys.nbytes
+        if self.values is not None:
+            total += self.values.nbytes
+        return total
+
+    @property
+    def nbytes_equivalent_fp16(self):
+        """FP16 equivalent memory for comparison."""
+        if self.keys is None:
+            return 0
+        B, n_kv_heads = self.keys.shape[:2]
+        T = self.offset
+        D = self.head_dim
+        return B * n_kv_heads * T * D * 2 * 2
 
     def get_seq_length(self) -> int:
         return self.offset
