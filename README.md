@@ -1,0 +1,157 @@
+# SMAQ-MLX — Log-Compressed Spectral Metric-Aware Quantization on Apple Silicon
+
+MLX port of [SMAQ](https://github.com/gauravsaini/smaq) for Apple Silicon, following the architecture patterns of [turboquant-mlx](https://github.com/sharpner/turboquant-mlx).
+
+**Paper**: [Beyond Rotation Invariance: Log-Compressed Spectral Metric-Aware Quantization](https://doi.org/10.5281/zenodo.19342144)
+
+## What is SMAQ?
+
+SMAQ is a KV-cache compression method for LLM inference that replaces conventional orthogonal preprocessing (rotations, Hadamard) with **log-compressed spectral metric shaping** derived from downstream logit MSE.
+
+Unlike TurboQuant's random rotation (which is rotation-invariant for adaptive VQ), SMAQ changes the *metric*, not the coordinates — reshaping quantization noise to align with query-sensitive directions.
+
+**Best fit for:**
+- Coding assistants
+- Domain-specific copilots
+- Vertical inference workloads with stable prompt patterns
+
+## Key Results (TinyLlama-1.1B, 8D blocks, 256 centroids)
+
+| Method | L4 | L8 | L12 | L16 | Mean |
+|--------|-----|-----|------|------|------|
+| Standard VQ | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
+| TurboQuant (rotation) | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
+| **SMAQ (Log c=5.0)** | **+5.2%** | **+0.1%** | **+14.1%** | **+13.9%** | **+8.3%** |
+
+## Quickstart
+
+```bash
+# Requirements: Apple Silicon Mac with Python 3.10+
+pip install mlx mlx-lm
+
+# Install SMAQ-MLX
+pip install -e .
+
+# Demo: text generation with SMAQ KV cache
+python run_llm.py
+
+# Benchmark: speed + quality
+python benchmark.py
+```
+
+### Custom Models
+
+```python
+import mlx_lm
+from smaq.kv_cache import SMAQKVCache
+from smaq.patch import apply as smaq_patch_apply
+
+smaq_patch_apply()  # Monkey-patch SDPA dispatch
+
+model, tokenizer = mlx_lm.load("mlx-community/Llama-3.2-3B-Instruct-4bit")
+head_dim = model.layers[0].self_attn.head_dim
+n_layers = len(model.layers)
+
+# Create SMAQ caches
+caches = [
+    SMAQKVCache(
+        head_dim=head_dim,
+        key_bits=3,
+        value_bits=2,
+        buffer_size=128,
+        layer_idx=i,
+    )
+    for i in range(n_layers)
+]
+
+# Calibrate (use domain-specific calibration data)
+import mlx.core as mx
+cal_keys = mx.random.normal((256, head_dim))
+cal_queries = mx.random.normal((256, head_dim))
+for cache in caches:
+    cache.key_quantizer.fit(cal_keys, cal_queries)
+
+# Generate
+output = mlx_lm.generate(model, tokenizer, prompt="Hello", max_tokens=100, kv_cache=caches)
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│  mlx-lm (Llama, Mistral, ...)               │
+│    ↓ SDPA dispatch (monkey-patch)           │
+├─────────────────────────────────────────────┤
+│  smaq.patch                                 │
+│    → Detects SMAQ KV cache objects          │
+│    → Routes to SMAQ attention               │
+├─────────────────────────────────────────────┤
+│                                             │
+│  smaq/                                      │
+│  ├── ssf.py          # Spectral shaping     │
+│  ├── block_vq.py     # Block VQ quantizer   │
+│  ├── quantizer.py    # Scalar quantizer     │
+│  ├── kv_cache.py     # KV cache             │
+│  ├── capture.py      # Ring buffer          │
+│  ├── store.py        # Compressed store     │
+│  ├── score.py        # Hybrid attention     │
+│  ├── attention_smaq.py # SMAQ SDPA         │
+│  └── patch.py        # mlx-lm integration   │
+│                                             │
+├─────────────────────────────────────────────┤
+│  MLX Metal Backend                          │
+│    → All ops are MLX-native                 │
+└─────────────────────────────────────────────┘
+```
+
+### Two Quantizer Paths
+
+| Path | Module | Description |
+|------|--------|-------------|
+| **Block VQ** | `block_vq.py` | K-means in SMAQ-shaped space (256 centroids, 8D blocks) — paper match |
+| **Scalar** | `quantizer.py` | Per-dimension scalar quantization with SMAQ metric — faster deployment |
+
+## How It Works
+
+1. **Query covariance**: Compute per-block Σ_q from calibration queries
+2. **Spectral shaping**: Apply f(λ) = log(1 + 5λ) to eigenvalues
+3. **Metric construction**: Build E = V · diag(f(λ)^½) · V^T
+4. **K-means in shaped space**: Standard k-means on E·k
+5. **Pre-decode centroids**: Store E⁻¹ · centroid — decode becomes pure table lookup
+
+## Project Structure
+
+```
+smaq-mlx/
+├── smaq/
+│   ├── __init__.py
+│   ├── ssf.py                 # Log-compressed spectral shaping
+│   ├── block_vq.py            # Block VQ quantizer (paper experiments)
+│   ├── quantizer.py           # Scalar quantizer (deployment path)
+│   ├── kv_cache.py            # SMAQ KV cache with prefill/append/attend
+│   ├── capture.py             # Ring buffer + streaming capture engine
+│   ├── store.py               # Chunked compressed KV store
+│   ├── score.py               # Hybrid attention: compressed + exact
+│   ├── attention_smaq.py      # SMAQ SDPA implementation
+│   └── patch.py               # Monkey-patch for mlx-lm SDPA dispatch
+├── tests/
+│   └── test_smaq.py           # Unit tests
+├── benchmark.py               # Speed + quality benchmark
+├── run_llm.py                 # Interactive demo
+├── requirements.txt
+├── README.md
+└── TODO.md
+```
+
+## Differences from Original SMAQ
+
+| Original (PyTorch/CUDA) | SMAQ-MLX (Apple Silicon) |
+|-------------------------|--------------------------|
+| PyTorch tensors | MLX arrays |
+| Triton kernels | MLX native ops |
+| vLLM integration | mlx-lm integration |
+| CUDA device | Apple Metal |
+
+## License
+
+MIT
