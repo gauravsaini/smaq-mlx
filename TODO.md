@@ -69,16 +69,27 @@ smaq-mlx/
 
 ## Progress Log
 
-### 2026-03-31
-- **Phase 1 complete**: ssf.py, block_vq.py, quantizer.py implemented
-- **Phase 2 complete**: kv_cache.py, capture.py, store.py, score.py implemented
-- **Phase 3 complete**: patch.py, attention_smaq.py implemented
-- **Phase 4 complete**: benchmark.py, run_llm.py, requirements.txt, README.md created
+### 2026-03-31 — Initial implementation
+- **Phase 1-3 complete**: All core components implemented
+- **Phase 4 complete**: benchmark.py, run_llm.py, requirements.txt, README.md
 - **Phase 5 complete**: 25/25 unit tests passing
-  - SSF tests: 3/3
-  - BlockVQ tests: 5/5
-  - ScalarQuantizer tests: 4/4
-  - KVCache tests: 7/7
-  - RingBuffer tests: 2/2
-  - CompressedKVStore tests: 3/3
-- **Remaining**: Integration tests with mlx-lm (requires model download)
+- **MLX compatibility fixes**: 
+  - `mx.linalg.eigh` → CPU stream
+  - `scatter_update` → `.at[].add()` / slice assignment
+  - `mx.random.choice` → `mx.random.categorical`
+  - `.copy()` → `mx.array()`
+
+### 2026-03-31 — Model testing
+- **Tested models on 8GB Mac**:
+  - Qwen3.5-2B-4bit: VLM, requires PyTorch/torchvision — not suitable
+  - Qwen3.5-2B-OptiQ-4bit: text-gen, 0.48GB RSS, but hybrid architecture (18 linear_attn + 6 self_attn layers) — SMAQ only applies to 6/24 layers
+  - **Llama-3.2-1B-Instruct-4bit**: text-gen, 0.72GB RSS, pure attention (16 layers, head_dim=64) — best fit
+- **SMAQ integration status**:
+  - Core math verified: SMAQ shaping reduces attention score MSE vs identity metric
+  - KVCache implements mlx-lm interface (update_and_fetch, offset, state)
+  - Drop-in replacement works but quantization quality needs proper calibration data
+  - Block VQ with 256 centroids/8D blocks shows good reconstruction quality
+- **Known limitations**:
+  - Random calibration data produces poor quantization — needs domain-specific calibration
+  - Scalar quantizer at 3-4 bits has high score MSE (~6-8) vs exact attention
+  - Full SDPA interception (computing attention directly against quantized keys) needs deeper mlx-lm integration

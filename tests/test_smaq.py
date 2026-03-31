@@ -157,57 +157,63 @@ class TestKVCache(unittest.TestCase):
         self.assertEqual(cache.head_dim, 64)
         self.assertEqual(cache.key_bits, 3)
         self.assertEqual(cache.value_bits, 2)
+        self.assertEqual(cache.offset, 0)
 
-    def test_kv_cache_prefill_small(self):
-        cache = SMAQKVCache(head_dim=64, buffer_size=128)
-
-        mx.random.seed(42)
-        keys = mx.random.normal((1, 4, 64, 64))
-        values = mx.random.normal((1, 4, 64, 64))
-
-        cache.prefill(keys, values)
-        self.assertEqual(cache.seq_len, 64)
-        self.assertIsNotNone(cache.key_buffer)
-
-    def test_kv_cache_prefill_large(self):
-        cache = SMAQKVCache(head_dim=64, buffer_size=32)
-
-        mx.random.seed(42)
-        keys = mx.random.normal((1, 4, 128, 64))
-        values = mx.random.normal((1, 4, 128, 64))
-
-        cache.prefill(keys, values)
-        self.assertEqual(cache.seq_len, 128)
-        self.assertIsNotNone(cache.key_quantized)
-        self.assertEqual(cache.key_buffer.shape[-2], 32)
-
-    def test_kv_cache_append(self):
-        cache = SMAQKVCache(head_dim=64, buffer_size=32)
+    def test_kv_cache_update_and_fetch(self):
+        cache = SMAQKVCache(head_dim=64, key_bits=4, value_bits=4)
 
         mx.random.seed(42)
         keys = mx.random.normal((1, 4, 16, 64))
         values = mx.random.normal((1, 4, 16, 64))
 
-        cache.prefill(keys, values)
-        self.assertEqual(cache.seq_len, 16)
+        returned_k, returned_v = cache.update_and_fetch(keys, values)
+        self.assertEqual(cache.offset, 16)
+        self.assertEqual(returned_k.shape, keys.shape)
+        self.assertEqual(returned_v.shape, values.shape)
 
-        # Append one token
-        new_key = mx.random.normal((1, 4, 1, 64))
-        new_value = mx.random.normal((1, 4, 1, 64))
-        cache.append(new_key, new_value)
-        self.assertEqual(cache.seq_len, 17)
-
-    def test_kv_cache_memory_bytes(self):
-        cache = SMAQKVCache(head_dim=64, buffer_size=32)
+    def test_kv_cache_multiple_updates(self):
+        cache = SMAQKVCache(head_dim=64, key_bits=4, value_bits=4)
 
         mx.random.seed(42)
-        keys = mx.random.normal((1, 4, 128, 64))
-        values = mx.random.normal((1, 4, 128, 64))
+        keys1 = mx.random.normal((1, 4, 16, 64))
+        values1 = mx.random.normal((1, 4, 16, 64))
+        cache.update_and_fetch(keys1, values1)
+        self.assertEqual(cache.offset, 16)
 
-        cache.prefill(keys, values)
+        keys2 = mx.random.normal((1, 4, 4, 64))
+        values2 = mx.random.normal((1, 4, 4, 64))
+        cache.update_and_fetch(keys2, values2)
+        self.assertEqual(cache.offset, 20)
+
+        returned_k, returned_v = cache.update_and_fetch(keys2, values2)
+        self.assertEqual(cache.offset, 24)
+        self.assertEqual(returned_k.shape[-2], 24)
+
+    def test_kv_cache_memory_bytes(self):
+        cache = SMAQKVCache(head_dim=64, key_bits=4, value_bits=4)
+
+        mx.random.seed(42)
+        keys = mx.random.normal((1, 4, 64, 64))
+        values = mx.random.normal((1, 4, 64, 64))
+
+        cache.update_and_fetch(keys, values)
         mem = cache.memory_bytes()
         self.assertIn("total", mem)
         self.assertGreater(mem["total"], 0)
+
+    def test_kv_cache_empty_and_trim(self):
+        cache = SMAQKVCache(head_dim=64, key_bits=4, value_bits=4)
+        self.assertTrue(cache.empty())
+
+        mx.random.seed(42)
+        keys = mx.random.normal((1, 4, 16, 64))
+        values = mx.random.normal((1, 4, 16, 64))
+        cache.update_and_fetch(keys, values)
+        self.assertFalse(cache.empty())
+
+        trimmed = cache.trim(4)
+        self.assertEqual(trimmed, 4)
+        self.assertEqual(cache.offset, 12)
 
     def test_quantize_values_2bit(self):
         mx.random.seed(42)

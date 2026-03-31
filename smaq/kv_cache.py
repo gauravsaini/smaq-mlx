@@ -1,9 +1,12 @@
 """SMAQ KV cache — MLX implementation.
 
-Ported from PyTorch to MLX for Apple Silicon execution.
+Drop-in replacement for mlx-lm's KVCache that compresses keys using SMAQ
+spectral metric-aware quantization and values using group quantization.
 
-Keys use the SMAQ quantizer; values use standard group quantization so the
-runtime can slot into the same decode pattern as TurboQuant.
+Implements the same interface as mlx-lm's KVCache:
+  - update_and_fetch(keys, values) -> (keys, values)
+  - offset property
+  - state property
 """
 
 import math
@@ -93,9 +96,12 @@ def dequantize_values(
 
 
 class SMAQKVCache:
-    """Drop-in KV cache with SMAQ-compressed history plus an exact recent buffer.
+    """Drop-in KV cache with SMAQ-compressed keys + group-quantized values.
 
-    MLX version — uses pre-allocation with step=256 like turboquant-mlx.
+    Implements the mlx-lm KVCache interface for seamless integration:
+      - update_and_fetch(keys, values) -> (keys, values)
+      - offset property (used by RoPE)
+      - state property (used by mlx-lm generation)
     """
 
     step = 256
@@ -123,131 +129,132 @@ class SMAQKVCache:
             bits=key_bits,
         )
 
+        # mlx-lm interface attributes
+        self.offset = 0
         self.seq_len = 0
+
+        # Compressed storage
         self.key_quantized: Optional[SMAQQuantized] = None
         self.value_data: Optional[mx.array] = None
         self.value_scales: Optional[mx.array] = None
         self.value_zeros: Optional[mx.array] = None
-        self.value_bits: int = value_bits
+
+        # Exact buffer for recent tokens
         self.key_buffer: Optional[mx.array] = None
         self.value_buffer: Optional[mx.array] = None
-        self._offset = 0
 
-    def prefill(self, keys: mx.array, values: mx.array):
-        """Capture a full prefill segment."""
-        seq_len = keys.shape[-2]
-        self.seq_len = seq_len
+        # Full dequantized buffers for drop-in compatibility
+        self._key_dequant: Optional[mx.array] = None
+        self._value_dequant: Optional[mx.array] = None
 
-        if seq_len <= self.buffer_size:
-            self.key_buffer = keys
-            self.value_buffer = values
-            return
+    def update_and_fetch(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
+        """Quantize new KV pairs, store compressed, return dequantized for SDPA.
 
-        n_quant = seq_len - self.buffer_size
-        keys_to_quant = keys[..., :n_quant, :]
-        values_to_quant = values[..., :n_quant, :]
-        self.key_buffer = keys[..., n_quant:, :]
-        self.value_buffer = values[..., n_quant:, :]
-        self.key_quantized = self.key_quantizer.quantize(keys_to_quant)
-        v_data, v_scales, v_zeros, _ = quantize_values(
-            values_to_quant, bits=self.value_bits, group_size=self.value_group_size
-        )
-        self.value_data = v_data
-        self.value_scales = v_scales
-        self.value_zeros = v_zeros
+        This is the main interface called by mlx-lm's attention layers.
+        Keys are SMAQ-quantized, values are group-quantized.
+        Dequantized versions are returned for the attention computation.
+        """
+        prev = self.offset
+        num_steps = keys.shape[2]
+        self.offset += num_steps
+        self.seq_len = self.offset
 
-    def append(self, key: mx.array, value: mx.array):
-        """Append a decode token into the exact ring and flush as needed."""
-        self.seq_len += key.shape[-2]
-
-        if self.key_buffer is not None:
-            self.key_buffer = mx.concatenate([self.key_buffer, key], axis=-2)
-            self.value_buffer = mx.concatenate([self.value_buffer, value], axis=-2)
-        else:
-            self.key_buffer = key
-            self.value_buffer = value
-
-        if self.key_buffer.shape[-2] > self.buffer_size:
-            self._flush_buffer()
-
-    def _flush_buffer(self):
-        n_flush = self.key_buffer.shape[-2] - self.buffer_size
-        keys_flush = self.key_buffer[..., :n_flush, :]
-        values_flush = self.value_buffer[..., :n_flush, :]
-
-        self.key_buffer = self.key_buffer[..., n_flush:, :]
-        self.value_buffer = self.value_buffer[..., n_flush:, :]
-
-        new_key_q = self.key_quantizer.quantize(keys_flush)
+        # SMAQ quantize keys
+        new_key_q = self.key_quantizer.quantize(keys)
+        # Group quantize values
         new_v_data, new_v_scales, new_v_zeros, _ = quantize_values(
-            values_flush, bits=self.value_bits, group_size=self.value_group_size
+            values, bits=self.value_bits, group_size=self.value_group_size
         )
 
+        # Dequantize for return
+        new_k_hat = self.key_quantizer.dequantize(new_key_q)
+        new_v_hat = dequantize_values(
+            new_v_data, new_v_scales, new_v_zeros,
+            self.value_bits, self.value_group_size
+        )
+
+        # Append to compressed storage
         if self.key_quantized is None:
             self.key_quantized = new_key_q
             self.value_data = new_v_data
             self.value_scales = new_v_scales
             self.value_zeros = new_v_zeros
-            return
+            self._key_dequant = new_k_hat
+            self._value_dequant = new_v_hat
+        else:
+            self.key_quantized = SMAQQuantized(
+                indices=mx.concatenate([self.key_quantized.indices, new_key_q.indices], axis=-2),
+                norms=mx.concatenate([self.key_quantized.norms, new_key_q.norms], axis=-1),
+                bits=new_key_q.bits,
+            )
+            self.value_data = mx.concatenate([self.value_data, new_v_data], axis=-2)
+            self.value_scales = mx.concatenate([self.value_scales, new_v_scales], axis=-2)
+            self.value_zeros = mx.concatenate([self.value_zeros, new_v_zeros], axis=-2)
+            self._key_dequant = mx.concatenate([self._key_dequant, new_k_hat], axis=-2)
+            self._value_dequant = mx.concatenate([self._value_dequant, new_v_hat], axis=-2)
 
-        self.key_quantized = SMAQQuantized(
-            indices=mx.concatenate([self.key_quantized.indices, new_key_q.indices], axis=-2),
-            norms=mx.concatenate([self.key_quantized.norms, new_key_q.norms], axis=-1),
-            bits=new_key_q.bits,
-        )
-        self.value_data = mx.concatenate([self.value_data, new_v_data], axis=-2)
-        self.value_scales = mx.concatenate([self.value_scales, new_v_scales], axis=-2)
-        self.value_zeros = mx.concatenate([self.value_zeros, new_v_zeros], axis=-2)
+        return self._key_dequant, self._value_dequant
+
+    @property
+    def state(self):
+        """Return state for mlx-lm compatibility."""
+        return [self._key_dequant, self._value_dequant] if self._key_dequant is not None else []
+
+    @state.setter
+    def state(self, v):
+        pass
+
+    @property
+    def meta_state(self):
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, v):
+        pass
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        if self._key_dequant is not None:
+            self._key_dequant = self._key_dequant[..., :self.offset, :]
+            self._value_dequant = self._value_dequant[..., :self.offset, :]
+        return n
+
+    def empty(self):
+        return self.key_quantized is None
+
+    def prefill(self, keys: mx.array, values: mx.array):
+        """Capture a full prefill segment (legacy interface)."""
+        self.update_and_fetch(keys, values)
+
+    def append(self, key: mx.array, value: mx.array):
+        """Append a decode token (legacy interface)."""
+        self.update_and_fetch(key, value)
 
     def attention_scores(self, query: mx.array, scale: Optional[float] = None) -> mx.array:
-        """Compute attention scores against compressed history and exact buffer."""
+        """Compute attention scores against compressed history."""
         if scale is None:
             scale = 1.0 / math.sqrt(self.head_dim)
-
-        scores_parts = []
-        if self.key_quantized is not None:
-            scores_parts.append(
-                self.key_quantizer.attention_score(query, self.key_quantized, scale=scale)
-            )
-
-        if self.key_buffer is not None:
-            scores_parts.append(
-                (query.astype(mx.float32) @ self.key_buffer.astype(mx.float32).transpose(0, 1, 3, 2)) * scale
-            )
-
-        if not scores_parts:
-            shape = (*query.shape[:-2], query.shape[-2], 0)
-            return mx.zeros(shape)
-
-        return mx.concatenate(scores_parts, axis=-1)
+        if self.key_quantized is None:
+            return mx.zeros((*query.shape[:-1], 0))
+        return self.key_quantizer.attention_score(query, self.key_quantized, scale=scale)
 
     def attend(self, attn_weights: mx.array) -> mx.array:
-        """Apply attention weights to compressed values and exact buffer values."""
-        output_parts = []
-        col_offset = 0
-
-        if self.value_data is not None:
-            n_quant = self.value_data.shape[-2]
-            w_quant = attn_weights[..., col_offset: col_offset + n_quant]
-            v_dequant = dequantize_values(
-                self.value_data, self.value_scales, self.value_zeros,
-                self.value_bits, self.value_group_size
-            )
-            output_parts.append(w_quant.astype(mx.float32) @ v_dequant)
-            col_offset += n_quant
-
-        if self.value_buffer is not None:
-            n_buf = self.value_buffer.shape[-2]
-            w_buf = attn_weights[..., col_offset: col_offset + n_buf]
-            output_parts.append(w_buf.astype(mx.float32) @ self.value_buffer)
-
-        if not output_parts:
+        """Apply attention weights to compressed values."""
+        if self.value_data is None:
             return mx.zeros((*attn_weights.shape[:-1], self.head_dim))
-        return sum(output_parts)
+        v_dequant = dequantize_values(
+            self.value_data, self.value_scales, self.value_zeros,
+            self.value_bits, self.value_group_size
+        )
+        return (attn_weights.astype(mx.float32) @ v_dequant)
 
     def memory_bytes(self) -> dict[str, int]:
         """Estimate memory usage of the cache."""
-        info = {"quantized_keys": 0, "quantized_values": 0, "buffer": 0, "total": 0}
+        info = {"quantized_keys": 0, "quantized_values": 0, "total": 0}
 
         if self.key_quantized is not None:
             info["quantized_keys"] += self.key_quantized.indices.size
@@ -258,13 +265,8 @@ class SMAQKVCache:
             info["quantized_values"] += self.value_scales.size * 2
             info["quantized_values"] += self.value_zeros.size * 2
 
-        if self.key_buffer is not None:
-            info["buffer"] += self.key_buffer.size * 2
-        if self.value_buffer is not None:
-            info["buffer"] += self.value_buffer.size * 2
-
-        info["total"] = info["quantized_keys"] + info["quantized_values"] + info["buffer"]
+        info["total"] = info["quantized_keys"] + info["quantized_values"]
         return info
 
     def get_seq_length(self) -> int:
-        return self.seq_len
+        return self.offset

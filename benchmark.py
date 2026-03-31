@@ -144,7 +144,7 @@ def run_benchmark(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SMAQ-MLX Benchmark")
-    parser.add_argument("--model", type=str, default="mlx-community/Llama-3.2-3B-Instruct-4bit")
+    parser.add_argument("--model", type=str, default="mlx-community/Llama-3.2-1B-Instruct-4bit")
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--key-bits", type=int, default=3)
     parser.add_argument("--value-bits", type=int, default=2)

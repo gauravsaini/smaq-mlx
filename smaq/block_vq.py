@@ -57,10 +57,10 @@ def _kmeans(
             probs = probs / denom
         else:
             probs = mx.full((n,), 1.0 / n)
-        idx = mx.random.choice(n, p=probs).item()
+        idx = mx.random.categorical(mx.log(probs + 1e-10)).item()
         indices.append(idx)
 
-    centroids = data[mx.array(indices)].copy()
+    centroids = mx.array(data[mx.array(indices)])
 
     # Lloyd iterations
     for _ in range(n_iters):

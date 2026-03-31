@@ -2,7 +2,7 @@
 
 Usage:
     python run_llm.py
-    python run_llm.py --model mlx-community/Llama-3.2-3B-Instruct-4bit
+    python run_llm.py --model mlx-community/Qwen3.5-2B-OptiQ-4bit
     python run_llm.py --key-bits 3 --value-bits 2
 """
 
@@ -27,24 +27,30 @@ def generate(
 ):
     """Generate text using SMAQ KV cache compression."""
     n_layers = len(model.layers)
+
+    # Find head_dim
     head_dim = model.layers[0].self_attn.head_dim
+    n_layers = len(model.layers)
+    n_kv_heads = model.layers[0].self_attn.n_kv_heads
+
+    print(f"Model config: head_dim={head_dim}, layers={n_layers}, n_kv_heads={n_kv_heads}")
 
     # Initialize SMAQ caches
     mx.random.seed(42)
     cal_keys = mx.random.normal((256, head_dim))
     cal_queries = mx.random.normal((256, head_dim))
+    Sigma_q = (cal_queries.T @ cal_queries) / cal_queries.shape[0]
 
     caches = []
     for layer_idx in range(n_layers):
         cache = SMAQKVCache(
             head_dim=head_dim,
+            Sigma_q=Sigma_q,
             key_bits=key_bits,
             value_bits=value_bits,
             buffer_size=buffer_size,
             layer_idx=layer_idx,
         )
-        # In practice, fit on calibration data from the domain
-        cache.key_quantizer.fit(cal_keys, cal_queries)
         caches.append(cache)
 
     # Encode prompt
@@ -93,7 +99,7 @@ def generate(
 
 def main():
     parser = argparse.ArgumentParser(description="SMAQ-MLX Demo")
-    parser.add_argument("--model", type=str, default="mlx-community/Llama-3.2-3B-Instruct-4bit")
+    parser.add_argument("--model", type=str, default="mlx-community/Llama-3.2-1B-Instruct-4bit")
     parser.add_argument("--prompt", type=str, default="The future of AI is")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temp", type=float, default=0.7)
