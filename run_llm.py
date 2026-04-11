@@ -14,7 +14,7 @@ import mlx_lm
 from mlx_lm.generate import generate_step
 from mlx_lm.sample_utils import make_sampler
 
-from smaq.kv_cache import SMAQKVCache
+from smaq_mlx.kv_cache import SMAQKVCache
 
 
 def generate(

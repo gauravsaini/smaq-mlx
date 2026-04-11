@@ -1,3 +1,13 @@
+Metadata-Version: 2.4
+Name: smaq-mlx
+Version: 0.1.0
+Summary: SMAQ KV-cache compression for mlx-lm on Apple Silicon
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: mlx>=0.20.0
+Requires-Dist: mlx-lm>=0.20.0
+
 # SMAQ-MLX — Log-Compressed Spectral Metric-Aware Quantization on Apple Silicon
 
 MLX port of [SMAQ](https://github.com/gauravsaini/smaq) for Apple Silicon, following the architecture patterns of [turboquant-mlx](https://github.com/sharpner/turboquant-mlx).
@@ -31,12 +41,8 @@ pip install mlx mlx-lm
 
 # Install SMAQ-MLX
 pip install -e .
-python -m smaq_mlx.install  # Post-install hook for transparent support
 
-# Running with SMAQ enabled:
-SMAQ_ENABLED=1 python -m mlx_lm.generate --model <path> --prompt "Hello"
-
-# Demo: interactive text generation
+# Demo: text generation with SMAQ KV cache
 python run_llm.py
 
 # Benchmark: speed + quality
@@ -47,8 +53,8 @@ python benchmark.py
 
 ```python
 import mlx_lm
-from smaq_mlx.kv_cache import SMAQKVCache
-from smaq_mlx.patch import apply as smaq_patch_apply
+from smaq.kv_cache import SMAQKVCache
+from smaq.patch import apply as smaq_patch_apply
 
 smaq_patch_apply()  # Monkey-patch SDPA dispatch
 
@@ -91,7 +97,7 @@ output = mlx_lm.generate(model, tokenizer, prompt="Hello", max_tokens=100, kv_ca
 │    → Routes to SMAQ attention               │
 ├─────────────────────────────────────────────┤
 │                                             │
-│  smaq_mlx/                                 │
+│  smaq/                                      │
 │  ├── ssf.py          # Spectral shaping     │
 │  ├── block_vq.py     # Block VQ quantizer   │
 │  ├── quantizer.py    # Scalar quantizer     │
@@ -99,9 +105,8 @@ output = mlx_lm.generate(model, tokenizer, prompt="Hello", max_tokens=100, kv_ca
 │  ├── capture.py      # Ring buffer          │
 │  ├── store.py        # Compressed store     │
 │  ├── score.py        # Hybrid attention     │
-│  ├── attention_smaq.py # SMAQ SDPA          │
-│  ├── patch.py        # mlx-lm integration   │
-│  └── install.py      # Installation hook    │
+│  ├── attention_smaq.py # SMAQ SDPA         │
+│  └── patch.py        # mlx-lm integration   │
 │                                             │
 ├─────────────────────────────────────────────┤
 │  MLX Metal Backend                          │
@@ -128,7 +133,7 @@ output = mlx_lm.generate(model, tokenizer, prompt="Hello", max_tokens=100, kv_ca
 
 ```
 smaq-mlx/
-├── smaq_mlx/
+├── smaq/
 │   ├── __init__.py
 │   ├── ssf.py                 # Log-compressed spectral shaping
 │   ├── block_vq.py            # Block VQ quantizer (paper experiments)
@@ -138,8 +143,7 @@ smaq-mlx/
 │   ├── store.py               # Chunked compressed KV store
 │   ├── score.py               # Hybrid attention: compressed + exact
 │   ├── attention_smaq.py      # SMAQ SDPA implementation
-│   ├── patch.py               # Monkey-patch for mlx-lm SDPA dispatch
-│   └── install.py             # Transparent installation hook
+│   └── patch.py               # Monkey-patch for mlx-lm SDPA dispatch
 ├── tests/
 │   └── test_smaq.py           # Unit tests
 ├── benchmark.py               # Speed + quality benchmark

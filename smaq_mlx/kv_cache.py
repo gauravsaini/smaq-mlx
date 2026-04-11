@@ -19,7 +19,19 @@ from typing import Optional
 
 import mlx.core as mx
 
-from smaq.quantizer import SMAQQuantized, SMAQQuantizer
+from smaq_mlx.quantizer import SMAQQuantized, SMAQQuantizer
+
+
+def _create_causal_mask(N, offset, window_size=None):
+    """Build a causal attention mask."""
+    rinds = mx.arange(offset + N)
+    linds = mx.arange(offset, offset + N) if offset else rinds
+    linds = linds[:, None]
+    rinds = rinds[None]
+    mask = linds >= rinds
+    if window_size is not None:
+        mask = mask & (linds < rinds + window_size)
+    return mask
 
 
 def unpack_values(data: mx.array, bits: int) -> mx.array:
@@ -157,6 +169,14 @@ class SMAQKVCache:
         """Support cache[0], cache[1] for linear_attn layers (Qwen3.5)."""
         return self._linear_attn_state[idx]
 
+    def __len__(self):
+        """Return the cache sequence length for mlx-lm attention mask creation."""
+        return self.offset
+
+    def __bool__(self):
+        """Always truthy so 'cache = cache or make_cache()' works."""
+        return True
+
     @property
     def lengths(self):
         return None
@@ -171,6 +191,14 @@ class SMAQKVCache:
         # but some layers explicitly call advance. We just ignore if already accounted for,
         # or implement it if needed. mlx_lm uses it for specific architectures.
         pass
+
+    def make_mask(self, N, return_array=False, window_size=None):
+        """Create attention mask compatible with mlx-lm's expectation."""
+        if N == 1:
+            return None
+        if return_array or (window_size and N > window_size):
+            return _create_causal_mask(N, self.offset, window_size=window_size)
+        return "causal"
 
     def update_and_fetch(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
         """Store KV pairs and return full precision for attention computation.
@@ -332,3 +360,15 @@ class SMAQKVCache:
 
     def get_seq_length(self) -> int:
         return self.offset
+
+    def to_quantized(self, group_size=64, bits=4):
+        """Compatibility stub — SMAQ cache is already compressed."""
+        return self
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        """Reconstruct from saved state (compatibility)."""
+        obj = cls.__new__(cls)
+        obj.state = state
+        obj.meta_state = meta_state
+        return obj

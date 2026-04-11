@@ -17,7 +17,7 @@ from typing import NamedTuple, Optional
 
 import mlx.core as mx
 
-from smaq.ssf import build_smaq_metric
+from smaq_mlx.ssf import build_smaq_metric
 
 
 class SMAQQuantized(NamedTuple):

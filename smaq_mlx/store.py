@@ -10,8 +10,8 @@ from typing import NamedTuple, Optional
 
 import mlx.core as mx
 
-from smaq.kv_cache import quantize_values, dequantize_values
-from smaq.quantizer import SMAQQuantized, SMAQQuantizer
+from smaq_mlx.kv_cache import quantize_values, dequantize_values
+from smaq_mlx.quantizer import SMAQQuantized, SMAQQuantizer
 
 
 class FlatCache(NamedTuple):

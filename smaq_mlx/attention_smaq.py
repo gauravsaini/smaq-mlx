@@ -12,8 +12,8 @@ from typing import Optional
 
 import mlx.core as mx
 
-from smaq.quantizer import SMAQQuantized, SMAQQuantizer
-from smaq.kv_cache import dequantize_values
+from smaq_mlx.quantizer import SMAQQuantized, SMAQQuantizer
+from smaq_mlx.kv_cache import dequantize_values
 
 
 def smaq_sdpa(

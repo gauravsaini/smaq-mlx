@@ -16,8 +16,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx_lm
 
-from smaq.kv_cache import SMAQKVCache
-from smaq.quantizer import SMAQQuantizer
+from smaq_mlx.kv_cache import SMAQKVCache
+from smaq_mlx.quantizer import SMAQQuantizer
 
 
 EVAL_TEXT = """

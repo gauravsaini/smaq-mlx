@@ -11,7 +11,7 @@ from typing import Optional, TYPE_CHECKING
 import mlx.core as mx
 
 if TYPE_CHECKING:
-    from smaq.store import CompressedKVStore
+    from smaq_mlx.store import CompressedKVStore
 
 
 class RingBuffer:

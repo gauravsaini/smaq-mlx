@@ -12,9 +12,9 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from smaq.kv_cache import dequantize_values
-from smaq.quantizer import SMAQQuantized, SMAQQuantizer
-from smaq.store import CompressedKVStore, FlatCache
+from smaq_mlx.kv_cache import dequantize_values
+from smaq_mlx.quantizer import SMAQQuantized, SMAQQuantizer
+from smaq_mlx.store import CompressedKVStore, FlatCache
 
 MIN_HISTORY_FOR_SMAQ = 16
 

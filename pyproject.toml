@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smaq-mlx"
+version = "0.1.0"
+description = "SMAQ KV-cache compression for mlx-lm on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "mlx>=0.20.0",
+    "mlx-lm>=0.20.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["smaq_mlx*"]

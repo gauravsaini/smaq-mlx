@@ -5,12 +5,12 @@ import unittest
 import mlx.core as mx
 import numpy as np
 
-from smaq.ssf import ssf_log, build_smaq_metric
-from smaq.block_vq import SMAQBlockVQ, BlockVQQuantized
-from smaq.quantizer import SMAQQuantizer, SMAQQuantized
-from smaq.kv_cache import SMAQKVCache, quantize_values, dequantize_values
-from smaq.capture import RingBuffer, KVCaptureEngine
-from smaq.store import CompressedKVStore
+from smaq_mlx.ssf import ssf_log, build_smaq_metric
+from smaq_mlx.block_vq import SMAQBlockVQ, BlockVQQuantized
+from smaq_mlx.quantizer import SMAQQuantizer, SMAQQuantized
+from smaq_mlx.kv_cache import SMAQKVCache, quantize_values, dequantize_values
+from smaq_mlx.capture import RingBuffer, KVCaptureEngine
+from smaq_mlx.store import CompressedKVStore
 
 
 class TestSSF(unittest.TestCase):
