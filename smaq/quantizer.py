@@ -100,6 +100,15 @@ class SMAQQuantizer:
 
         mx.eval(self.E, self.E_inv, self.centroids, self.boundaries, self.decision_boundaries)
 
+    def fit(self, cal_keys: mx.array, cal_queries: mx.array):
+        mu = mx.mean(cal_queries, axis=0)
+        q_c = cal_queries - mu
+        Sigma_q = (q_c.T @ q_c) / max(1, q_c.shape[0])
+        E, E_inv = build_smaq_metric(Sigma_q.astype(mx.float32), c=5.0)
+        self.E = E.astype(mx.float32)
+        self.E_inv = E_inv.astype(mx.float32)
+        mx.eval(self.E, self.E_inv)
+
     def rotate_query(self, query: mx.array) -> mx.array:
         """Project queries into the inverse metric space."""
         return (query.astype(mx.float32) @ self.E_inv.T).astype(query.dtype)

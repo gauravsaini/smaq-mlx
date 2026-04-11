@@ -13,6 +13,7 @@ import argparse
 import time
 
 import mlx.core as mx
+import mlx.nn as nn
 import mlx_lm
 
 from smaq.kv_cache import SMAQKVCache
@@ -38,7 +39,7 @@ def compute_perplexity(model, tokenizer, text: str, cache=None) -> float:
         logits = logits[0]
 
     logits = logits[0].astype(mx.float32)
-    loss = mx.mean(mx.losses.cross_entropy(logits, target_ids))
+    loss = mx.mean(nn.losses.cross_entropy(logits, target_ids))
     perplexity = mx.exp(loss).item()
     return perplexity
 
@@ -61,7 +62,7 @@ def benchmark_throughput(model, tokenizer, prompt: str, max_tokens: int = 256, c
             logits = output
 
         next_token = mx.argmax(logits[0, -1])
-        input_ids = mx.concatenate([input_ids, next_token[None]])
+        input_ids = next_token[None]
         generated += 1
 
         if next_token.item() == tokenizer.eos_token_id:
@@ -99,7 +100,7 @@ def run_benchmark(
     print("FP16 Baseline")
     print("=" * 60)
 
-    fp16_cache = [mlx_lm.models.base.KVCache() for _ in range(n_layers)]
+    fp16_cache = mlx_lm.models.cache.make_prompt_cache(model)
     ppl_fp16 = compute_perplexity(model, tokenizer, EVAL_TEXT, cache=fp16_cache)
     print(f"Perplexity: {ppl_fp16:.2f}")
 
