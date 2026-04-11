@@ -139,6 +139,7 @@ class SMAQKVCache:
         self.offset = 0
         self.seq_len = 0
 
+
         # Full precision storage (for exact attention)
         self.keys: Optional[mx.array] = None
         self.values: Optional[mx.array] = None
@@ -156,9 +157,20 @@ class SMAQKVCache:
         """Support cache[0], cache[1] for linear_attn layers (Qwen3.5)."""
         return self._linear_attn_state[idx]
 
+    @property
+    def lengths(self):
+        return None
+
     def __setitem__(self, idx, value):
         """Support cache[0] = x, cache[1] = y for linear_attn layers."""
         self._linear_attn_state[idx] = value
+        
+    def advance(self, offset: int = 1):
+        """Advance cache offset."""
+        # Typically the offset is automatically managed in update_and_fetch,
+        # but some layers explicitly call advance. We just ignore if already accounted for,
+        # or implement it if needed. mlx_lm uses it for specific architectures.
+        pass
 
     def update_and_fetch(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
         """Store KV pairs and return full precision for attention computation.
@@ -189,6 +201,16 @@ class SMAQKVCache:
         # Also quantize for memory tracking
         # Reshape from (B, n_kv_heads, T, D) to (B * n_kv_heads * T, D) for quantizer
         k_shape = keys.shape
+        
+        # Support Gemma 4 models which concat Keys and Values creating a double width head_dim (unified KV)
+        if k_shape[-1] != self.head_dim:
+            self.head_dim = k_shape[-1]
+            self.key_quantizer = SMAQQuantizer(
+                dim=self.head_dim,
+                Sigma_q=mx.eye(self.head_dim),
+                bits=self.key_bits,
+            )
+            
         k_flat = keys.reshape(-1, k_shape[-1])
         new_key_q = self.key_quantizer.quantize(k_flat)
         # Reshape indices back to (B, n_kv_heads, T, packed_D)
@@ -277,13 +299,13 @@ class SMAQKVCache:
         info = {"quantized_keys": 0, "quantized_values": 0, "total": 0}
 
         if self.key_quantized is not None:
-            info["quantized_keys"] += self.key_quantized.indices.size
-            info["quantized_keys"] += self.key_quantized.norms.size * 2
+            info["quantized_keys"] += self.key_quantized.indices.nbytes
+            info["quantized_keys"] += self.key_quantized.norms.nbytes
 
         if self.value_data is not None:
-            info["quantized_values"] += self.value_data.size
-            info["quantized_values"] += self.value_scales.size * 2
-            info["quantized_values"] += self.value_zeros.size * 2
+            info["quantized_values"] += self.value_data.nbytes
+            info["quantized_values"] += self.value_scales.nbytes
+            info["quantized_values"] += self.value_zeros.nbytes
 
         info["total"] = info["quantized_keys"] + info["quantized_values"]
         return info
@@ -293,9 +315,9 @@ class SMAQKVCache:
         """Memory usage in bytes (for compatibility with mlx-lm)."""
         total = 0
         if self.keys is not None:
-            total += self.keys.nbytes
+            total += self.keys[..., :self.offset, :].nbytes
         if self.values is not None:
-            total += self.values.nbytes
+            total += self.values[..., :self.offset, :].nbytes
         return total
 
     @property
@@ -303,10 +325,10 @@ class SMAQKVCache:
         """FP16 equivalent memory for comparison."""
         if self.keys is None:
             return 0
-        B, n_kv_heads = self.keys.shape[:2]
-        T = self.offset
-        D = self.head_dim
-        return B * n_kv_heads * T * D * 2 * 2
+        # Determine exact FP16 representation of stored sequence
+        k_bytes = self.keys[..., :self.offset, :].size * 2
+        v_bytes = self.values[..., :self.offset, :].size * 2
+        return k_bytes + v_bytes
 
     def get_seq_length(self) -> int:
         return self.offset

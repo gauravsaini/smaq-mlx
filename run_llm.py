@@ -59,8 +59,17 @@ def generate(
         for i in range(n_layers)
     ]
 
-    # Encode prompt
-    tokens = tokenizer.encode(prompt)
+    # Encode prompt using chat template if available
+    try:
+        if hasattr(tokenizer, "apply_chat_template"):
+            messages = [{"role": "user", "content": prompt}]
+            prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            tokens = tokenizer.encode(prompt_text)
+        else:
+            tokens = tokenizer.encode(prompt)
+    except Exception:
+        tokens = tokenizer.encode(prompt)
+        
     input_ids = mx.array(tokens)
 
     print(f"Prompt: {prompt}")
