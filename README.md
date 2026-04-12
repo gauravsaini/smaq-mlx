@@ -1,12 +1,13 @@
 # SMAQ-MLX
 
-SMAQ-MLX is an **experimental MLX integration package** for running SMAQ KV-cache compression inside real `mlx_lm` generation.
+SMAQ-MLX is an **experimental MLX integration package** for running KV-cache compression backends inside real `mlx_lm` generation.
 
 It is not just offline quantization code. It hooks the actual MLX serving path:
 
 - patches `mlx_lm.models.cache.make_prompt_cache`
 - patches `mlx_lm.models.base.scaled_dot_product_attention`
 - uses compressed historical K/V during decode
+- selects a runtime backend explicitly instead of relying on patch order
 
 On tested Qwen-family MLX text models, this path is real, not shadow-only.
 
@@ -18,6 +19,7 @@ What is working well:
 
 - real `mlx_lm` integration
 - explicit in-process API
+- unified backend adapter layer
 - baseline vs SMAQ benchmarking
 - deterministic exact-vs-SMAQ quality checks
 - Qwen-family MLX text model support
@@ -33,7 +35,7 @@ Known rough edges:
 Today, `smaq-mlx` should be understood as:
 
 - a **real MLX serving integration**
-- a **KV-cache compression backend** for `mlx_lm`
+- a **KV-cache compression backend host** for `mlx_lm`
 - a package you can integrate into Python application code
 
 It is **not** just a notebook, offline metric calculator, or shadow-cache demo.
@@ -74,7 +76,7 @@ If we later add calibration cleanly, it should be:
 Recommended integration today is:
 
 1. install `smaq-mlx`
-2. enable SMAQ in-process with `SMAQConfig`
+2. enable a backend in-process with `MLXRuntimeConfig`
 3. load model normally with `mlx_lm.load(...)`
 4. generate normally with `mlx_lm.generate(...)`
 
@@ -87,15 +89,34 @@ uv pip install mlx mlx-lm
 uv pip install -e .
 ```
 
+## Backend Matrix
+
+| Backend | Status | Package | Notes |
+| --- | --- | --- | --- |
+| `polarquant` | Experimental | `mlx-turboquant` | PolarQuant-style rotated scalar quantization without QJL correction |
+| `smaq` | Experimental | built into `smaq-mlx` | Best current fidelity story on tested Qwen-family MLX workloads |
+| `stacked_turbo_smaq` | Research | `turboquant-mlx` | Experimental two-stage cascade: TurboQuant approximation feeding SMAQ |
+| `turboquant` | Experimental | `turboquant-mlx` | Works through the unified adapter layer |
+
+You can inspect this at runtime with:
+
+```python
+from smaq_mlx import available_backends, backend_matrix
+
+print(available_backends())
+print(backend_matrix())
+```
+
 ## Recommended Usage
 
 Use the **in-process API**. This is the supported path for application code.
 
 ```python
 import mlx_lm
-from smaq_mlx import SMAQConfig, enable_smaq
+from smaq_mlx import MLXRuntimeConfig, enable_backend
 
-config = SMAQConfig(
+config = MLXRuntimeConfig(
+    backend="smaq",
     key_bits=4,
     value_bits=4,
     mode="hybrid",
@@ -103,7 +124,7 @@ config = SMAQConfig(
     require_true_compressed=False,
 )
 
-enable_smaq(config)
+enable_backend(config)
 model, tokenizer = mlx_lm.load("mlx-community/Qwen3.5-4B-MLX-4bit")
 text = mlx_lm.generate(model, tokenizer, prompt="Explain KV cache compression.", max_tokens=64)
 print(text)
@@ -120,7 +141,7 @@ You can also use the one-shot wrapper:
 
 ```python
 import mlx_lm
-from smaq_mlx import SMAQConfig, generate
+from smaq_mlx import MLXRuntimeConfig, generate
 
 model, tokenizer = mlx_lm.load("mlx-community/Qwen3.5-4B-MLX-4bit")
 text = generate(
@@ -128,7 +149,7 @@ text = generate(
     tokenizer,
     prompt="Explain KV cache compression.",
     max_tokens=64,
-    config=SMAQConfig(key_bits=4, value_bits=4),
+    config=MLXRuntimeConfig(backend="smaq", key_bits=4, value_bits=4),
 )
 print(text)
 ```
@@ -137,14 +158,15 @@ Or create caches explicitly:
 
 ```python
 import mlx_lm
-from smaq_mlx import SMAQConfig, enable_smaq, make_smaq_prompt_cache
+from smaq_mlx import MLXRuntimeConfig, enable_backend, make_prompt_cache
 
-config = SMAQConfig(key_bits=4, value_bits=4)
-enable_smaq(config)
+config = MLXRuntimeConfig(backend="smaq", key_bits=4, value_bits=4)
+enable_backend(config)
 
 model, tokenizer = mlx_lm.load("mlx-community/Qwen3.5-4B-MLX-4bit")
-caches = make_smaq_prompt_cache(
+caches = make_prompt_cache(
     model,
+    backend=config.backend,
     key_bits=config.key_bits,
     value_bits=config.value_bits,
     mode=config.mode,
@@ -177,10 +199,11 @@ Minimal application integration usually looks like this:
 
 ```python
 import mlx_lm
-from smaq_mlx import SMAQConfig, enable_smaq
+from smaq_mlx import MLXRuntimeConfig, enable_backend
 
-enable_smaq(
-    SMAQConfig(
+enable_backend(
+    MLXRuntimeConfig(
+        backend="smaq",
         key_bits=4,
         value_bits=4,
         mode="hybrid",
@@ -194,9 +217,9 @@ response = mlx_lm.generate(model, tokenizer, prompt="Hello", max_tokens=64)
 If your app already owns prompt-cache creation, use:
 
 ```python
-from smaq_mlx import make_smaq_prompt_cache
+from smaq_mlx import make_prompt_cache
 
-caches = make_smaq_prompt_cache(model, key_bits=4, value_bits=4, mode="hybrid")
+caches = make_prompt_cache(model, backend="smaq", key_bits=4, value_bits=4, mode="hybrid")
 response = mlx_lm.generate(
     model,
     tokenizer,
@@ -205,6 +228,28 @@ response = mlx_lm.generate(
     prompt_cache=caches,
 )
 ```
+
+## Backend API
+
+The runtime is intentionally designed as:
+
+- one MLX patch owner
+- many selectable backends
+- no backend-specific patch ordering
+
+Detailed backend contract:
+
+- [docs/backend-api.md](./docs/backend-api.md)
+
+To add a backend:
+
+1. inherit from `RuntimeBackend`
+2. implement cache creation + SDPA dispatch
+3. register it with `register_backend(...)`
+4. add conformance tests
+
+The current `polarquant` backend is implemented against the MLX-native `mlx-turboquant` reference path.
+Right now it uses one shared bit-width for keys and values, mirroring that upstream cache shape.
 
 ## What “Real Integration” Means Here
 
@@ -242,6 +287,7 @@ Tested successfully in this repo on:
 - Qwen-family MLX text models at 4B, 9B, and 27B scale
 - deterministic exact-vs-SMAQ output matching on a small prompt suite for a 27B Qwen-family model
 - real baseline-vs-SMAQ serving runs through `mlx_lm.generate(...)`
+- unified `smaq` / `turboquant` backend selection through one adapter layer
 
 ## Current Recommendation
 
@@ -266,11 +312,21 @@ SMAQ-MLX does **not** yet claim:
 
 Main symbols:
 
+- `MLXRuntimeConfig`
+- `enable_backend`
+- `disable_backend`
+- `backend_enabled`
+- `available_backends`
+- `backend_matrix`
+- `generate`
+- `make_prompt_cache`
+
+Backward-compatible SMAQ aliases are still exported:
+
 - `SMAQConfig`
 - `enable_smaq`
 - `disable_smaq`
 - `smaq_enabled`
-- `generate`
 - `make_smaq_prompt_cache`
 
 ## License

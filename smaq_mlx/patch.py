@@ -38,8 +38,7 @@ except ImportError:  # pragma: no cover - import guard for non-mlx_lm envs
     _cache = None
     _base = None
 
-from smaq_mlx.layout import infer_model_layout_adapter
-from smaq_mlx.kv_cache import SMAQKVCache
+from smaq_mlx.backends import available_backends, dispatch_sdpa, make_prompt_cache_for_backend
 
 # Preserve originals
 _original_make_prompt_cache = getattr(_cache, "make_prompt_cache", None)
@@ -47,11 +46,18 @@ _original_sdpa = getattr(_base, "scaled_dot_product_attention", None)
 _patched = False
 _runtime_config = {
     "enabled": None,
+    "backend": None,
     "key_bits": None,
     "value_bits": None,
     "mode": None,
     "strict_benchmark": None,
     "require_true_compressed": None,
+    "polarquant_bits": None,
+    "polarquant_key_seed": None,
+    "polarquant_value_seed": None,
+    "turboquant_bits": None,
+    "turboquant_seed": None,
+    "turboquant_fused": None,
 }
 
 
@@ -65,11 +71,18 @@ def _normalize_config(config: Any = None, **overrides) -> dict[str, Any]:
         else:
             for key in (
                 "enabled",
+                "backend",
                 "key_bits",
                 "value_bits",
                 "mode",
                 "strict_benchmark",
                 "require_true_compressed",
+                "polarquant_bits",
+                "polarquant_key_seed",
+                "polarquant_value_seed",
+                "turboquant_bits",
+                "turboquant_seed",
+                "turboquant_fused",
             ):
                 if hasattr(config, key):
                     data[key] = getattr(config, key)
@@ -110,11 +123,50 @@ def _resolve_int(config_key: str, env_key: str, default: int) -> int:
     return int(os.environ.get(env_key, str(default)))
 
 
+def _resolve_float(config_key: str, env_key: str, default: float) -> float:
+    value = _runtime_config.get(config_key)
+    if value is not None:
+        return float(value)
+    return float(os.environ.get(env_key, str(default)))
+
+
 def _resolve_str(config_key: str, env_key: str, default: str) -> str:
     value = _runtime_config.get(config_key)
     if value is not None:
         return str(value)
     return os.environ.get(env_key, default)
+
+
+def make_prompt_cache(
+    model: nn.Module,
+    backend: str = "smaq",
+    key_bits: int = 4,
+    value_bits: int = 4,
+    Sigma_q: Optional[mx.array] = None,
+    mode: str = "hybrid",
+    strict_benchmark: bool = False,
+    layout_adapter=None,
+    **kwargs,
+):
+    """Create backend-managed prompt caches for all compatible layers."""
+    if _cache is None:
+        raise RuntimeError("mlx-lm not installed in current environment")
+    config = {
+        "backend": backend,
+        "key_bits": key_bits,
+        "value_bits": value_bits,
+        "Sigma_q": Sigma_q,
+        "mode": mode,
+        "strict_benchmark": strict_benchmark,
+        "layout_adapter": layout_adapter,
+        **kwargs,
+    }
+    return make_prompt_cache_for_backend(
+        backend,
+        model,
+        cache_module=_cache,
+        config=config,
+    )
 
 
 def make_smaq_prompt_cache(
@@ -127,65 +179,18 @@ def make_smaq_prompt_cache(
     layout_adapter=None,
     **kwargs,
 ):
-    """Create SMAQ KV caches for all layers of the model.
-
-    Drop-in replacement for mlx_lm.models.cache.make_prompt_cache().
-    Returns a list of SMAQKVCache objects instead of KVCache objects.
-    """
-    layout_adapter = layout_adapter or infer_model_layout_adapter(model)
-
-    if hasattr(model, "make_cache") and _cache is not None:
-        original_caches = model.make_cache()
-        result = []
-        for i, c in enumerate(original_caches):
-            if isinstance(c, (_cache.KVCache, _cache.RotatingKVCache)):
-                head_dim = _get_head_dim(model, i)
-                result.append(
-                    SMAQKVCache(
-                        head_dim=head_dim,
-                        Sigma_q=Sigma_q,
-                        key_bits=key_bits,
-                        value_bits=value_bits,
-                        layer_idx=i,
-                        layout_adapter=layout_adapter,
-                        mode=mode,
-                        strict_benchmark=strict_benchmark,
-                    )
-                )
-            else:
-                result.append(c)
-        return result
-
-    num_layers = len(model.layers)
-    head_dim = _get_head_dim(model, 0)
-
-    return [
-        SMAQKVCache(
-            head_dim=head_dim,
-            Sigma_q=Sigma_q,
-            key_bits=key_bits,
-            value_bits=value_bits,
-            layer_idx=i,
-            layout_adapter=layout_adapter,
-            mode=mode,
-            strict_benchmark=strict_benchmark,
-        )
-        for i in range(num_layers)
-    ]
-
-
-def _get_head_dim(model, layer_idx: int) -> int:
-    """Extract head_dim from a model layer."""
-    layer = model.layers[layer_idx]
-    if hasattr(layer, "self_attn"):
-        attn = layer.self_attn
-        if hasattr(attn, "head_dim"):
-            return attn.head_dim
-        # Fallback: derive from hidden_size / num_heads
-        if hasattr(attn, "hidden_size") and hasattr(attn, "num_heads"):
-            return attn.hidden_size // attn.num_heads
-    # Default fallback
-    return 128
+    """Backward-compatible SMAQ cache helper."""
+    return make_prompt_cache(
+        model,
+        backend="smaq",
+        key_bits=key_bits,
+        value_bits=value_bits,
+        Sigma_q=Sigma_q,
+        mode=mode,
+        strict_benchmark=strict_benchmark,
+        layout_adapter=layout_adapter,
+        **kwargs,
+    )
 
 
 def _patched_make_prompt_cache(model, max_kv_size=None, **kwargs):
@@ -196,34 +201,63 @@ def _patched_make_prompt_cache(model, max_kv_size=None, **kwargs):
             raise RuntimeError("mlx-lm not installed in current environment")
         return _original_make_prompt_cache(model, max_kv_size=max_kv_size)
 
+    backend = _resolve_str("backend", "SMAQ_BACKEND", "smaq")
     key_bits = _resolve_int("key_bits", "SMAQ_KEY_BITS", 4)
     value_bits = _resolve_int("value_bits", "SMAQ_VALUE_BITS", 4)
     mode = _resolve_str("mode", "SMAQ_CACHE_MODE", "hybrid")
     strict = _resolve_bool("strict_benchmark", "SMAQ_BENCHMARK_STRICT", False)
-    return make_smaq_prompt_cache(
+    polarquant_bits = _resolve_float("polarquant_bits", "POLARQUANT_BITS", 3.0)
+    polarquant_key_seed = _resolve_int("polarquant_key_seed", "POLARQUANT_KEY_SEED", 42)
+    polarquant_value_seed = _resolve_int("polarquant_value_seed", "POLARQUANT_VALUE_SEED", 43)
+    turboquant_bits = _resolve_int("turboquant_bits", "TURBOQUANT_BITS", 3)
+    turboquant_seed = _resolve_int("turboquant_seed", "TURBOQUANT_SEED", 42)
+    turboquant_fused = _resolve_bool("turboquant_fused", "TURBOQUANT_FUSED", True)
+    return make_prompt_cache(
         model,
+        backend=backend,
         key_bits=key_bits,
         value_bits=value_bits,
         mode=mode,
         strict_benchmark=strict,
+        polarquant_bits=polarquant_bits,
+        polarquant_key_seed=polarquant_key_seed,
+        polarquant_value_seed=polarquant_value_seed,
+        turboquant_bits=turboquant_bits,
+        turboquant_seed=turboquant_seed,
+        turboquant_fused=turboquant_fused,
     )
 
 
 def _patched_sdpa(queries, keys, values, cache, scale, mask, sinks=None, **kwargs):
-    """Patched SDPA — route SMAQ caches to compressed-history attention."""
-    if isinstance(cache, SMAQKVCache):
-        from smaq_mlx.attention_smaq import smaq_sdpa
-
-        require_true = _resolve_bool(
+    """Patched SDPA — route supported backend caches to their runtime backend."""
+    dispatch_config = {
+        "backend": _resolve_str("backend", "SMAQ_BACKEND", "smaq"),
+        "require_true_compressed": _resolve_bool(
             "require_true_compressed", "SMAQ_REQUIRE_TRUE_COMPRESSED", False
-        )
-        return smaq_sdpa(
-            queries,
-            cache,
-            scale=scale,
-            mask=mask,
-            require_true_compressed=require_true,
-        )
+        ),
+        "key_bits": _resolve_int("key_bits", "SMAQ_KEY_BITS", 4),
+        "value_bits": _resolve_int("value_bits", "SMAQ_VALUE_BITS", 4),
+        "polarquant_bits": _resolve_float("polarquant_bits", "POLARQUANT_BITS", 3.0),
+        "polarquant_key_seed": _resolve_int("polarquant_key_seed", "POLARQUANT_KEY_SEED", 42),
+        "polarquant_value_seed": _resolve_int("polarquant_value_seed", "POLARQUANT_VALUE_SEED", 43),
+        "turboquant_bits": _resolve_int("turboquant_bits", "TURBOQUANT_BITS", 3),
+        "turboquant_seed": _resolve_int("turboquant_seed", "TURBOQUANT_SEED", 42),
+        "turboquant_fused": _resolve_bool("turboquant_fused", "TURBOQUANT_FUSED", True),
+    }
+    dispatched = dispatch_sdpa(
+        queries,
+        keys,
+        values,
+        cache,
+        scale=scale,
+        mask=mask,
+        sinks=sinks,
+        config=dispatch_config,
+        original_sdpa=_original_sdpa,
+        **kwargs,
+    )
+    if dispatched is not None:
+        return dispatched
     if _original_sdpa is None:
         raise RuntimeError("mlx_lm not installed; cannot use original SDPA")
     return _original_sdpa(queries, keys, values, cache, scale, mask, sinks=sinks, **kwargs)
@@ -233,22 +267,36 @@ def apply(
     config: Any = None,
     *,
     enabled: Optional[bool] = None,
+    backend: Optional[str] = None,
     key_bits: Optional[int] = None,
     value_bits: Optional[int] = None,
     mode: Optional[str] = None,
     strict_benchmark: Optional[bool] = None,
     require_true_compressed: Optional[bool] = None,
+    polarquant_bits: Optional[int] = None,
+    polarquant_key_seed: Optional[int] = None,
+    polarquant_value_seed: Optional[int] = None,
+    turboquant_bits: Optional[int] = None,
+    turboquant_seed: Optional[int] = None,
+    turboquant_fused: Optional[bool] = None,
 ):
     """Activate the SMAQ monkey-patches. Idempotent."""
     global _patched
     configure(
         config,
         enabled=enabled,
+        backend=backend,
         key_bits=key_bits,
         value_bits=value_bits,
         mode=mode,
         strict_benchmark=strict_benchmark,
         require_true_compressed=require_true_compressed,
+        polarquant_bits=polarquant_bits,
+        polarquant_key_seed=polarquant_key_seed,
+        polarquant_value_seed=polarquant_value_seed,
+        turboquant_bits=turboquant_bits,
+        turboquant_seed=turboquant_seed,
+        turboquant_fused=turboquant_fused,
     )
     if _patched:
         return
@@ -260,7 +308,12 @@ def apply(
     # Announce once
     key_bits = _resolve_int("key_bits", "SMAQ_KEY_BITS", 4)
     value_bits = _resolve_int("value_bits", "SMAQ_VALUE_BITS", 4)
-    print(f"[SMAQ] Patched mlx-lm — key_bits={key_bits}, value_bits={value_bits}")
+    backend = _resolve_str("backend", "SMAQ_BACKEND", "smaq")
+    print(
+        f"[SMAQ] Patched mlx-lm — backend={backend}, "
+        f"available_backends={','.join(available_backends())}, "
+        f"key_bits={key_bits}, value_bits={value_bits}"
+    )
 
 
 def revert():

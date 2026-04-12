@@ -2,3 +2,5 @@
 .DS_Store
 .venv
 smaq/*pycache*
+smaq_mlx.egg-info/
+uv.lock
