@@ -20,15 +20,15 @@ What is working well:
 - real `mlx_lm` integration
 - explicit in-process API
 - unified backend adapter layer
-- baseline vs SMAQ benchmarking
-- deterministic exact-vs-SMAQ quality checks
+- backend eval matrix across `smaq`, `turboquant`, `polarquant`, and `rotorquant`
+- deterministic quality checks, sampled generations, teacher-forced PPL, and long-context speed/memory harnesses
 - Qwen-family MLX text model support
 
 Known rough edges:
 
 - some tokenizer stacks hit the Mistral regex warning/fallback path
 - Gemma-family support is still performance-rough
-- public compatibility matrix is still small
+- `rotorquant` is a real first-pass runtime backend, but it is not competitive yet
 
 ## What This Package Is
 
@@ -94,6 +94,7 @@ uv pip install -e .
 | Backend | Status | Package | Notes |
 | --- | --- | --- | --- |
 | `polarquant` | Experimental | `mlx-turboquant` | PolarQuant-style rotated scalar quantization without QJL correction |
+| `rotorquant` | Experimental | built into `smaq-mlx` | First-pass rotor-based backend; currently far behind on speed and quality |
 | `smaq` | Experimental | built into `smaq-mlx` | Best current fidelity story on tested Qwen-family MLX workloads |
 | `stacked_turbo_smaq` | Research | `turboquant-mlx` | Experimental two-stage cascade: TurboQuant approximation feeding SMAQ |
 | `turboquant` | Experimental | `turboquant-mlx` | Works through the unified adapter layer |
@@ -106,6 +107,55 @@ from smaq_mlx import available_backends, backend_matrix
 print(available_backends())
 print(backend_matrix())
 ```
+
+## Current Eval Snapshot
+
+The most useful current benchmark surface is the SSH-box eval matrix in
+`/Users/ektasaini/Desktop/smaq/scripts/run_mlx_full_eval_matrix.sh`.
+It runs:
+
+- deterministic exact-match checks against base
+- sampled generation smoke checks
+- teacher-forced PPL
+- long-context speed and KV-memory accounting
+
+On the tested 9B TurboQuant-bundle workload (`alexcovo/qwen35-9b-mlx-turboquant-tq3`), the current picture is:
+
+| Backend | Deterministic Match vs Base | PPL | Long-Context Speed | KV Compression | KV Reduction |
+| --- | --- | --- | --- | --- | --- |
+| `base` | n/a | `10.482` | `6.536 tok/s` | n/a | n/a |
+| `smaq` | `12/12` | `10.482` | `6.799 tok/s` | `3.453x` | `71.04%` |
+| `turboquant` | `1/12` | `10.748` | `6.493 tok/s` | `4.741x` | `78.91%` |
+| `polarquant` | `9/12` | `10.751` | `4.637 tok/s` | `4.752x` | `78.96%` |
+| `rotorquant` | `4/12` | `12.746` | `1.240 tok/s` | `1.842x` | `45.7%` |
+
+That makes the current trade-off fairly clear:
+
+- `smaq` is the fidelity leader on the tested suite
+- `turboquant` and `polarquant` lead on raw KV compression
+- `rotorquant` is real, but this first runtime backend is not ready to compete yet
+
+We also ran the same eval surface as a smoke matrix on the larger 27B model
+`mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit`:
+
+| Backend | Deterministic Match vs Base | Long-Context Speed | KV Compression | KV Reduction |
+| --- | --- | --- | --- | --- |
+| `base` | n/a | `3.269 tok/s` | n/a | n/a |
+| `smaq` | `12/12` | `3.211 tok/s` | `3.244x` | `69.18%` |
+| `turboquant` | `4/12` | `3.253 tok/s` | `4.741x` | `78.91%` |
+| `polarquant` | `10/12` | `2.232 tok/s` | `4.746x` | `78.93%` |
+| `rotorquant` | `6/12` | `1.308 tok/s` | `1.842x` | `45.7%` |
+
+One important caveat for the 27B smoke runs:
+
+- the known tokenizer fallback path is still active on that model
+- so the larger-model tiny-split PPL numbers are useful for direction, not publication-grade claims
+
+Practical takeaway right now:
+
+- use `smaq` when output fidelity is the priority
+- use `turboquant` or `polarquant` when raw KV compression is the priority
+- treat `rotorquant` as an experimental backend that still needs serious performance work
 
 ## Recommended Usage
 
