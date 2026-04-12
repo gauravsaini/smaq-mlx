@@ -20,7 +20,9 @@ from smaq_mlx.capture import KVCaptureEngine, RingBuffer
 from smaq_mlx.layout import GemmaLayoutAdapter, ModelLayoutAdapter, QwenLayoutAdapter, infer_model_layout_adapter
 from smaq_mlx.kv_cache import SMAQKVCache
 from smaq_mlx.quantizer import SMAQQuantized, SMAQQuantizer
+from smaq_mlx.rotor_cache import RotorQuantKVCache
 from smaq_mlx.score import compute_hybrid_attention
+from smaq_mlx.rotorquant import RotorQuantMSE
 from smaq_mlx.stacked_cache import TurboSMAQCascadeCache
 from smaq_mlx.store import CompressedKVStore
 from smaq_mlx.attention_smaq import smaq_sdpa
@@ -42,6 +44,8 @@ __all__ = [
     "ModelLayoutAdapter",
     "QwenLayoutAdapter",
     "RingBuffer",
+    "RotorQuantKVCache",
+    "RotorQuantMSE",
     "SMAQBlockVQ",
     "SMAQConfig",
     "SMAQKVCache",

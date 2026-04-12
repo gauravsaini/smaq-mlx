@@ -15,6 +15,7 @@ import mlx.core as mx
 from smaq_mlx.attention_smaq import smaq_sdpa
 from smaq_mlx.kv_cache import SMAQKVCache
 from smaq_mlx.layout import infer_model_layout_adapter
+from smaq_mlx.rotor_cache import RotorQuantKVCache
 
 
 @dataclass(frozen=True)
@@ -356,6 +357,92 @@ class PolarQuantBackend(RuntimeBackend):
         )
 
 
+class RotorQuantBackend(RuntimeBackend):
+    def __init__(self):
+        super().__init__(
+            name="rotorquant",
+            description="RotorQuant-style MLX backend using rotor decorrelation and scalar cache reconstruction.",
+            status="experimental",
+        )
+
+    @staticmethod
+    def _resolve_bits(config: Dict[str, Any]) -> int:
+        bits = config.get("rotorquant_bits")
+        key_bits = config.get("key_bits")
+        value_bits = config.get("value_bits")
+        if bits is not None:
+            return int(bits)
+        if key_bits is not None and value_bits is not None and int(key_bits) != int(value_bits):
+            raise ValueError(
+                "RotorQuant backend currently requires a shared bit-width for keys and values. "
+                "Set `rotorquant_bits`, or keep `key_bits == value_bits`."
+            )
+        if key_bits is not None:
+            return int(key_bits)
+        if value_bits is not None:
+            return int(value_bits)
+        return 3
+
+    def supports_cache(self, cache: Any) -> bool:
+        return isinstance(cache, RotorQuantKVCache)
+
+    def make_prompt_cache(self, model: Any, *, cache_module: Any, config: Dict[str, Any]) -> list[Any]:
+        bits = self._resolve_bits(config)
+        key_seed = int(config.get("rotorquant_key_seed", 42))
+        value_seed = int(config.get("rotorquant_value_seed", 43))
+
+        if hasattr(model, "make_cache") and cache_module is not None:
+            original_caches = model.make_cache()
+            result = []
+            for i, c in enumerate(original_caches):
+                if isinstance(c, cache_module.KVCache):
+                    result.append(
+                        RotorQuantKVCache(
+                            bits=bits,
+                            head_dim=_get_head_dim(model, i),
+                            key_seed=key_seed,
+                            value_seed=value_seed,
+                        )
+                    )
+                else:
+                    result.append(c)
+            return result
+
+        num_layers = len(model.layers)
+        return [
+            RotorQuantKVCache(
+                bits=bits,
+                head_dim=_get_head_dim(model, i),
+                key_seed=key_seed,
+                value_seed=value_seed,
+            )
+            for i in range(num_layers)
+        ]
+
+    def sdpa(
+        self,
+        queries: Any,
+        keys: Any,
+        values: Any,
+        cache: Any,
+        *,
+        scale: float,
+        mask: Any,
+        sinks: Any = None,
+        config: Dict[str, Any],
+        original_sdpa: Any = None,
+        **kwargs,
+    ):
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            sinks=sinks,
+        )
+
+
 class StackedTurboSMAQBackend(RuntimeBackend):
     def __init__(self):
         super().__init__(
@@ -503,6 +590,7 @@ class PlaceholderBackend(RuntimeBackend):
 
 _BACKENDS: Dict[str, RuntimeBackend] = {
     "polarquant": PolarQuantBackend(),
+    "rotorquant": RotorQuantBackend(),
     "smaq": SMAQBackend(),
     "stacked_turbo_smaq": StackedTurboSMAQBackend(),
     "turboquant": TurboQuantBackend(),

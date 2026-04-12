@@ -14,6 +14,8 @@ from smaq_mlx.attention_smaq import smaq_sdpa
 from smaq_mlx.api import MLXRuntimeConfig, SMAQConfig
 from smaq_mlx.quantizer import SMAQQuantizer, SMAQQuantized
 from smaq_mlx.kv_cache import SMAQKVCache, quantize_values, dequantize_values
+from smaq_mlx.rotor_cache import RotorQuantKVCache
+from smaq_mlx.rotorquant import RotorQuantMSE
 from smaq_mlx.capture import RingBuffer, KVCaptureEngine
 from smaq_mlx.store import CompressedKVStore
 from smaq_mlx.patch import clear_configuration, configure, current_configuration
@@ -231,6 +233,29 @@ class TestKVCache(unittest.TestCase):
         self.assertEqual(reconstructed.shape, v.shape)
 
 
+class TestRotorQuant(unittest.TestCase):
+    """Tests for RotorQuant-inspired backend pieces."""
+
+    def test_rotor_quant_roundtrip_shape(self):
+        quantizer = RotorQuantMSE(d=64, bit_width=3, seed=42)
+        vectors = np.random.randn(8, 64).astype(np.float32)
+        quantized = quantizer.quantize(vectors)
+        reconstructed = quantizer.dequantize(quantized.indices, quantized.norms)
+        self.assertEqual(reconstructed.shape, vectors.shape)
+
+    def test_rotor_cache_update_and_fetch(self):
+        cache = RotorQuantKVCache(bits=3, head_dim=64)
+        mx.random.seed(42)
+        keys = mx.random.normal((1, 4, 8, 64))
+        values = mx.random.normal((1, 4, 8, 64))
+        returned_k, returned_v = cache.update_and_fetch(keys, values)
+        self.assertEqual(returned_k.shape, (1, 4, 8, 64))
+        self.assertEqual(returned_v.shape, (1, 4, 8, 64))
+        self.assertGreater(cache.nbytes, 0)
+        self.assertGreater(cache.uncompressed_nbytes, 0)
+        self.assertGreater(cache.compression_ratio, 1.0)
+
+
 class TestPublicApi(unittest.TestCase):
     """Tests for user-facing public API helpers."""
 
@@ -255,12 +280,14 @@ class TestPublicApi(unittest.TestCase):
     def test_available_backends(self):
         names = available_backends()
         self.assertIn("polarquant", names)
+        self.assertIn("rotorquant", names)
         self.assertIn("smaq", names)
         self.assertIn("stacked_turbo_smaq", names)
         self.assertIn("turboquant", names)
 
     def test_get_backend(self):
         self.assertEqual(get_backend("polarquant").name, "polarquant")
+        self.assertEqual(get_backend("rotorquant").name, "rotorquant")
         self.assertEqual(get_backend("smaq").name, "smaq")
         self.assertEqual(get_backend("stacked_turbo_smaq").name, "stacked_turbo_smaq")
         self.assertEqual(get_backend("turboquant").name, "turboquant")
@@ -269,6 +296,7 @@ class TestPublicApi(unittest.TestCase):
         entries = backend_matrix()
         by_name = {entry["name"]: entry for entry in entries}
         self.assertEqual(by_name["polarquant"]["status"], "experimental")
+        self.assertEqual(by_name["rotorquant"]["status"], "experimental")
         self.assertEqual(by_name["polarquant"]["requires_package"], "mlx-turboquant")
         self.assertEqual(by_name["smaq"]["status"], "experimental")
         self.assertEqual(by_name["stacked_turbo_smaq"]["status"], "research")
@@ -292,6 +320,21 @@ class TestPublicApi(unittest.TestCase):
         self.assertEqual(current["polarquant_bits"], 3)
         self.assertEqual(current["polarquant_key_seed"], 11)
         self.assertEqual(current["polarquant_value_seed"], 12)
+
+    def test_patch_runtime_configuration_supports_rotorquant(self):
+        configure(
+            MLXRuntimeConfig(
+                backend="rotorquant",
+                rotorquant_bits=3,
+                rotorquant_key_seed=21,
+                rotorquant_value_seed=22,
+            )
+        )
+        current = current_configuration()
+        self.assertEqual(current["backend"], "rotorquant")
+        self.assertEqual(current["rotorquant_bits"], 3)
+        self.assertEqual(current["rotorquant_key_seed"], 21)
+        self.assertEqual(current["rotorquant_value_seed"], 22)
 
     def test_validate_backend_accepts_custom_backend(self):
         class DummyBackend(RuntimeBackend):

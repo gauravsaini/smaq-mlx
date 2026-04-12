@@ -55,6 +55,9 @@ _runtime_config = {
     "polarquant_bits": None,
     "polarquant_key_seed": None,
     "polarquant_value_seed": None,
+    "rotorquant_bits": None,
+    "rotorquant_key_seed": None,
+    "rotorquant_value_seed": None,
     "turboquant_bits": None,
     "turboquant_seed": None,
     "turboquant_fused": None,
@@ -80,6 +83,9 @@ def _normalize_config(config: Any = None, **overrides) -> dict[str, Any]:
                 "polarquant_bits",
                 "polarquant_key_seed",
                 "polarquant_value_seed",
+                "rotorquant_bits",
+                "rotorquant_key_seed",
+                "rotorquant_value_seed",
                 "turboquant_bits",
                 "turboquant_seed",
                 "turboquant_fused",
@@ -209,6 +215,9 @@ def _patched_make_prompt_cache(model, max_kv_size=None, **kwargs):
     polarquant_bits = _resolve_float("polarquant_bits", "POLARQUANT_BITS", 3.0)
     polarquant_key_seed = _resolve_int("polarquant_key_seed", "POLARQUANT_KEY_SEED", 42)
     polarquant_value_seed = _resolve_int("polarquant_value_seed", "POLARQUANT_VALUE_SEED", 43)
+    rotorquant_bits = _resolve_int("rotorquant_bits", "ROTORQUANT_BITS", 3)
+    rotorquant_key_seed = _resolve_int("rotorquant_key_seed", "ROTORQUANT_KEY_SEED", 42)
+    rotorquant_value_seed = _resolve_int("rotorquant_value_seed", "ROTORQUANT_VALUE_SEED", 43)
     turboquant_bits = _resolve_int("turboquant_bits", "TURBOQUANT_BITS", 3)
     turboquant_seed = _resolve_int("turboquant_seed", "TURBOQUANT_SEED", 42)
     turboquant_fused = _resolve_bool("turboquant_fused", "TURBOQUANT_FUSED", True)
@@ -222,6 +231,9 @@ def _patched_make_prompt_cache(model, max_kv_size=None, **kwargs):
         polarquant_bits=polarquant_bits,
         polarquant_key_seed=polarquant_key_seed,
         polarquant_value_seed=polarquant_value_seed,
+        rotorquant_bits=rotorquant_bits,
+        rotorquant_key_seed=rotorquant_key_seed,
+        rotorquant_value_seed=rotorquant_value_seed,
         turboquant_bits=turboquant_bits,
         turboquant_seed=turboquant_seed,
         turboquant_fused=turboquant_fused,
@@ -240,6 +252,9 @@ def _patched_sdpa(queries, keys, values, cache, scale, mask, sinks=None, **kwarg
         "polarquant_bits": _resolve_float("polarquant_bits", "POLARQUANT_BITS", 3.0),
         "polarquant_key_seed": _resolve_int("polarquant_key_seed", "POLARQUANT_KEY_SEED", 42),
         "polarquant_value_seed": _resolve_int("polarquant_value_seed", "POLARQUANT_VALUE_SEED", 43),
+        "rotorquant_bits": _resolve_int("rotorquant_bits", "ROTORQUANT_BITS", 3),
+        "rotorquant_key_seed": _resolve_int("rotorquant_key_seed", "ROTORQUANT_KEY_SEED", 42),
+        "rotorquant_value_seed": _resolve_int("rotorquant_value_seed", "ROTORQUANT_VALUE_SEED", 43),
         "turboquant_bits": _resolve_int("turboquant_bits", "TURBOQUANT_BITS", 3),
         "turboquant_seed": _resolve_int("turboquant_seed", "TURBOQUANT_SEED", 42),
         "turboquant_fused": _resolve_bool("turboquant_fused", "TURBOQUANT_FUSED", True),
@@ -276,6 +291,9 @@ def apply(
     polarquant_bits: Optional[int] = None,
     polarquant_key_seed: Optional[int] = None,
     polarquant_value_seed: Optional[int] = None,
+    rotorquant_bits: Optional[int] = None,
+    rotorquant_key_seed: Optional[int] = None,
+    rotorquant_value_seed: Optional[int] = None,
     turboquant_bits: Optional[int] = None,
     turboquant_seed: Optional[int] = None,
     turboquant_fused: Optional[bool] = None,
@@ -294,6 +312,9 @@ def apply(
         polarquant_bits=polarquant_bits,
         polarquant_key_seed=polarquant_key_seed,
         polarquant_value_seed=polarquant_value_seed,
+        rotorquant_bits=rotorquant_bits,
+        rotorquant_key_seed=rotorquant_key_seed,
+        rotorquant_value_seed=rotorquant_value_seed,
         turboquant_bits=turboquant_bits,
         turboquant_seed=turboquant_seed,
         turboquant_fused=turboquant_fused,
