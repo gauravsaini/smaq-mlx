@@ -23,22 +23,27 @@ class FoldedTurboSMAQKVCache:
         self,
         bits: int = 3,
         head_dim: int = 128,
+        n_kv_heads: int = 1,
         key_seed: int = 42,
         value_seed: int = 43,
         smaq_c: float = 5.0,
+        Sigma_q=None,
     ):
         self.bits = int(bits)
         self.head_dim = int(head_dim)
+        self.n_kv_heads = int(n_kv_heads)
         self.offset = 0
         self.key_quantizer = FoldedTurboQuantizer(
             dim=self.head_dim,
+            n_kv_heads=self.n_kv_heads,
             bits=self.bits,
             seed=key_seed,
-            Sigma_q=None,
+            Sigma_q=Sigma_q,
             c=smaq_c,
         )
         self.value_quantizer = FoldedTurboQuantizer(
             dim=self.head_dim,
+            n_kv_heads=self.n_kv_heads,
             bits=self.bits,
             seed=value_seed,
             Sigma_q=None,
@@ -110,12 +115,12 @@ class FoldedTurboSMAQKVCache:
         if self._key_packed is None or (previous + steps) > self._stored_capacity:
             self._expand_storage(bsz, n_kv_heads, steps, keys.dtype)
 
-        key_packed, key_norms = self.key_quantizer.quantize(keys.reshape(-1, dim))
-        value_packed, value_norms = self.value_quantizer.quantize(values.reshape(-1, dim))
-        self._key_packed[..., previous:previous + steps, :] = key_packed.reshape(bsz, n_kv_heads, steps, self._packed_dim)
-        self._key_norms[..., previous:previous + steps] = key_norms.reshape(bsz, n_kv_heads, steps).astype(keys.dtype)
-        self._value_packed[..., previous:previous + steps, :] = value_packed.reshape(bsz, n_kv_heads, steps, self._packed_dim)
-        self._value_norms[..., previous:previous + steps] = value_norms.reshape(bsz, n_kv_heads, steps).astype(values.dtype)
+        key_packed, key_norms = self.key_quantizer.quantize(keys)
+        value_packed, value_norms = self.value_quantizer.quantize(values)
+        self._key_packed[..., previous:previous + steps, :] = key_packed
+        self._key_norms[..., previous:previous + steps] = key_norms.astype(keys.dtype)
+        self._value_packed[..., previous:previous + steps, :] = value_packed
+        self._value_norms[..., previous:previous + steps] = value_norms.astype(values.dtype)
         self.offset += steps
         return self.materialize(dtype=keys.dtype)
 
@@ -123,35 +128,41 @@ class FoldedTurboSMAQKVCache:
         if self._key_packed is None or self.offset == 0:
             empty = mx.zeros((0, 0, 0, self.head_dim), dtype=dtype)
             return empty, empty
-        bsz, n_kv_heads = int(self._key_packed.shape[0]), int(self._key_packed.shape[1])
         key_hat = self.key_quantizer.dequantize(
-            self._key_packed[..., :self.offset, :].reshape(-1, self._packed_dim),
-            self._key_norms[..., :self.offset].reshape(-1),
-        ).reshape(bsz, n_kv_heads, self.offset, self.head_dim)
+            self._key_packed[..., :self.offset, :],
+            self._key_norms[..., :self.offset],
+        )
         value_hat = self.value_quantizer.dequantize(
-            self._value_packed[..., :self.offset, :].reshape(-1, self._packed_dim),
-            self._value_norms[..., :self.offset].reshape(-1),
-        ).reshape(bsz, n_kv_heads, self.offset, self.head_dim)
+            self._value_packed[..., :self.offset, :],
+            self._value_norms[..., :self.offset],
+        )
         return key_hat.astype(dtype), value_hat.astype(dtype)
 
     def fit_metric_from_queries(self, queries: mx.array):
         if self.metric_fitted or queries.shape[-1] != self.head_dim:
             return
-        q = queries.astype(mx.float32).reshape(-1, self.head_dim)
-        if q.shape[0] < 8:
+        bsz, n_heads, seq_len, head_dim = queries.shape
+        if n_heads % self.n_kv_heads != 0:
             return
+        groups = n_heads // self.n_kv_heads
+        
+        q = queries.astype(mx.float32).reshape(bsz, self.n_kv_heads, groups, seq_len, head_dim)
+        q = q.transpose(1, 0, 2, 3, 4).reshape(self.n_kv_heads, -1, head_dim)
+        
+        if q.shape[1] < 8:
+            return
+            
         key_fp = None
         if self._key_packed is not None and self.offset > 0:
             key_fp = self.key_quantizer.dequantize(
-                self._key_packed[..., :self.offset, :].reshape(-1, self._packed_dim),
-                self._key_norms[..., :self.offset].reshape(-1),
+                self._key_packed[..., :self.offset, :],
+                self._key_norms[..., :self.offset],
             )
         self.key_quantizer.fit(q)
         if key_fp is not None:
             repacked, renorms = self.key_quantizer.quantize(key_fp)
-            bsz, n_kv_heads = int(self._key_packed.shape[0]), int(self._key_packed.shape[1])
-            self._key_packed[..., :self.offset, :] = repacked.reshape(bsz, n_kv_heads, self.offset, self._packed_dim)
-            self._key_norms[..., :self.offset] = renorms.reshape(bsz, n_kv_heads, self.offset).astype(self._key_norms.dtype)
+            self._key_packed[..., :self.offset, :] = repacked
+            self._key_norms[..., :self.offset] = renorms.astype(self._key_norms.dtype)
 
     def memory_bytes(self):
         if self._key_packed is None:

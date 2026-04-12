@@ -92,12 +92,14 @@ class FoldedTurboQuantizer:
         self,
         dim: int,
         bits: int = 3,
+        n_kv_heads: int = 1,
         seed: int = 42,
         Sigma_q: Optional[mx.array] = None,
         c: float = 5.0,
     ):
         self.dim = int(dim)
         self.bits = int(bits)
+        self.n_kv_heads = int(n_kv_heads)
         self.seed = int(seed)
         self.c = float(c)
         self.signs = random_diagonal_sign(self.dim, seed=self.seed)
@@ -105,46 +107,51 @@ class FoldedTurboQuantizer:
         self.boundaries = (self.centroids[:-1] + self.centroids[1:]) / 2.0
         self.scale = 1.0 / math.sqrt(self.dim)
         self.metric_fitted = False
+        self.Sigma_q = Sigma_q
         self.set_metric(Sigma_q)
 
     def set_metric(self, Sigma_q: Optional[mx.array]):
+        self.Sigma_q = Sigma_q
         if Sigma_q is None:
-            self.diag_scale = mx.ones((self.dim,), dtype=mx.float32)
+            self.dynamic_scale = mx.full((self.n_kv_heads, 1, self.dim), self.scale, dtype=mx.float32)
+            self.dynamic_boundaries = self.boundaries[:, None, None, None] * self.dynamic_scale[None, :, :, :]
+            self.dynamic_centroids = self.centroids[:, None, None, None] * self.dynamic_scale[None, :, :, :]
             self.metric_fitted = False
         else:
-            # 1. Generate explicit randomized Hadamard matrix
             I = mx.eye(self.dim, dtype=mx.float32)
-            # Each column of I is a basis vector. Let's transform them.
-            # randomized_hadamard expects (batch, dim). I is (dim, dim)
             H_matrix = randomized_hadamard_transform(I, self.signs)
             
-            # 2. Rotate the offline covariance
-            Sigma_q = Sigma_q.astype(mx.float32)
-            # Sigma_rot = H * Sigma_q * H.T
-            Sigma_rot = H_matrix @ Sigma_q @ H_matrix.T
-            
-            # 3. Extract diagonal (variances in the rotated space)
-            V = mx.diag(Sigma_rot)
-            
-            # 4. Log-compression scaling on the diagonals (c is compression factor)
-            w = mx.log(1.0 + self.c * mx.maximum(V, 0.0))
-            
-            # 5. Volume preserving normalization
-            # To avoid numerical issues, compute mean of log(w)
-            log_w = mx.log(mx.maximum(w, 1e-8))
-            mean_log_w = mx.mean(log_w)
-            normalized_w = mx.exp(log_w - mean_log_w)
-            
-            # The scale factor is the square root of the shaped density
-            self.diag_scale = mx.sqrt(normalized_w)
+            scales = []
+            for h in range(self.n_kv_heads):
+                # 0. Build the SMAQ shaped metric to prevent condition-number collapse
+                E, _ = build_smaq_metric(Sigma_q[h], c=self.c)
+                # Shaped covariance 
+                M = E @ E.T
+                
+                # 1. Normalize and rotate the shaped covariance
+                M = M.astype(mx.float32)
+                trace = mx.sum(mx.diag(M))
+                normalized_M = M / mx.maximum(trace, 1e-8)
+                M_rot = H_matrix @ normalized_M @ H_matrix.T
+                
+                # 2. Extract the true analytical variance in the rotated space
+                V = mx.maximum(mx.diag(M_rot), 1e-8)
+                scales.append(mx.sqrt(V))
+                
+            # Compute optimal per-channel bounds using true standard deviation
+            self.dynamic_scale = mx.stack(scales)[:, None, :]  # Shape: [n_kv_heads, 1, dim]
+            self.dynamic_boundaries = self.boundaries[:, None, None, None] * self.dynamic_scale[None, :, :, :]
+            self.dynamic_centroids = self.centroids[:, None, None, None] * self.dynamic_scale[None, :, :, :]
             self.metric_fitted = True
             
-        mx.eval(self.diag_scale, self.signs, self.centroids, self.boundaries)
+        mx.eval(self.dynamic_scale, self.dynamic_boundaries, self.dynamic_centroids, self.signs)
 
     def fit(self, calibration_queries: mx.array):
-        q = calibration_queries.astype(mx.float32).reshape(-1, self.dim)
-        q_centered = q - mx.mean(q, axis=0, keepdims=True)
-        Sigma_q = (q_centered.T @ q_centered) / max(1, q_centered.shape[0])
+        # queries shape: [n_kv_heads, N, dim]
+        q = calibration_queries.astype(mx.float32)
+        q_centered = q - mx.mean(q, axis=1, keepdims=True)
+        # Vectorized covariance per head
+        Sigma_q = (q_centered.transpose(0, 2, 1) @ q_centered) / max(1, q_centered.shape[1])
         self.set_metric(Sigma_q)
 
     def quantize(self, x: mx.array) -> tuple[mx.array, mx.array]:
@@ -156,29 +163,24 @@ class FoldedTurboQuantizer:
         # 1. Hadamard Rotation standard
         x_rot = randomized_hadamard_transform(x_unit, self.signs)
         
-        # 2. Weaker Folded Variant: Diagonal scaling
-        # Stretch/compress the values according to importance
-        x_shaped = x_rot * self.diag_scale
-        
-        # 3. Scale back for fixed Gaussian scalar bounds
-        x_scaled = x_shaped / self.scale
-
-        # Broadcast boundaries if necessary for per-dim logic
-        indices = mx.zeros(x_scaled.shape, dtype=mx.uint8)
-        for boundary in self.boundaries.tolist():
-            indices = indices + (x_scaled > boundary).astype(mx.uint8)
+        # 2. Dynamic Codebook Normalization: mathematically safe index selection 
+        #    using per-channel pre-scaled Gaussian boundaries directly.
+        indices = mx.zeros(x_rot.shape, dtype=mx.uint8)
+        for i in range(len(self.boundaries)):
+            indices = indices + (x_rot > self.dynamic_boundaries[i]).astype(mx.uint8)
         packed = _pack_indices(indices, self.bits)
         return packed, norms
 
     def dequantize(self, packed: mx.array, norms: mx.array) -> mx.array:
         indices = _unpack_indices(packed, self.bits, self.dim).astype(mx.int32)
+        
+        # 1 & 2. Reconstruct using the dynamic dimension-scaled codebook
+        # We index from standard centroids then scale, which is arithmetically equivalent 
+        # to self.dynamic_centroids[indices, d] but preserves MLX fast inner-indexing logic.
         y_hat = self.centroids[indices]
-        y_hat = y_hat * self.scale
+        x_shaped_hat = y_hat * self.dynamic_scale
         
-        # Inverse Diagonal scale
-        x_shaped_hat = y_hat / self.diag_scale
-        
-        # Inverse Hadamard
+        # 3. Inverse Hadamard
         x_unit_hat = inverse_randomized_hadamard(x_shaped_hat, self.signs)
         
         return (x_unit_hat * norms[..., None]).astype(mx.float32)

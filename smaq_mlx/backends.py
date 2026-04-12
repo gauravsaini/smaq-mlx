@@ -78,6 +78,45 @@ def _get_head_dim(model, layer_idx: int) -> int:
     return 128
 
 
+def _get_n_kv_heads(model, layer_idx: int) -> int:
+    try:
+        config = model.config
+        if hasattr(config, "text_config"):
+            if isinstance(config.text_config, dict):
+                tc = config.text_config
+                layer_types = tc.get("layer_types", None)
+                if layer_types:
+                    l_type = layer_types[layer_idx]
+                    if l_type == "full_attention":
+                        return tc.get("num_key_value_heads", 1)
+                    elif l_type == "linear_attention":
+                        return tc.get("linear_num_key_heads", 1)
+                return tc.get("num_key_value_heads", 1)
+            else:
+                tc = config.text_config
+                layer_types = getattr(tc, "layer_types", None)
+                if layer_types:
+                    l_type = layer_types[layer_idx]
+                    if l_type == "full_attention":
+                        return getattr(tc, "num_key_value_heads", 1)
+                    elif l_type == "linear_attention":
+                        return getattr(tc, "linear_num_key_heads", 1)
+                return getattr(tc, "num_key_value_heads", 1)
+    except Exception:
+        pass
+        
+    layer = model.layers[layer_idx]
+    if hasattr(layer, "self_attn"):
+        attn = layer.self_attn
+        if hasattr(attn, "num_kv_heads"):
+            return attn.num_kv_heads
+        if hasattr(attn, "num_key_value_heads"):
+            return attn.num_key_value_heads
+        if hasattr(attn, "num_heads"):
+            return attn.num_heads
+    return 1
+
+
 class SMAQBackend(RuntimeBackend):
     def __init__(self):
         super().__init__(
@@ -272,19 +311,23 @@ class FoldedTurboSMAQBackend(RuntimeBackend):
         key_seed = int(config.get("folded_turbo_key_seed") or config.get("turboquant_seed", 42))
         value_seed = int(config.get("folded_turbo_value_seed") or (key_seed + 1))
         smaq_c = float(config.get("folded_smaq_c", 5.0))
+        sigma_q_dict = config.get("Sigma_q") or {}
 
         if hasattr(model, "make_cache") and cache_module is not None:
             original_caches = model.make_cache()
             result = []
             for i, c in enumerate(original_caches):
                 if isinstance(c, (cache_module.KVCache, cache_module.RotatingKVCache)):
+                    layer_sigma = sigma_q_dict.get(i) if isinstance(sigma_q_dict, dict) else None
                     result.append(
                         FoldedTurboSMAQKVCache(
                             bits=bits,
                             head_dim=_get_head_dim(model, i),
+                            n_kv_heads=_get_n_kv_heads(model, i),
                             key_seed=key_seed,
                             value_seed=value_seed,
                             smaq_c=smaq_c,
+                            Sigma_q=layer_sigma,
                         )
                     )
                 else:
@@ -296,9 +339,11 @@ class FoldedTurboSMAQBackend(RuntimeBackend):
             FoldedTurboSMAQKVCache(
                 bits=bits,
                 head_dim=_get_head_dim(model, i),
+                n_kv_heads=_get_n_kv_heads(model, i),
                 key_seed=key_seed,
                 value_seed=value_seed,
                 smaq_c=smaq_c,
+                Sigma_q=sigma_q_dict.get(i) if isinstance(sigma_q_dict, dict) else None,
             )
             for i in range(num_layers)
         ]

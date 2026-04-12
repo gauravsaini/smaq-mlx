@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import mlx_lm
 
@@ -44,6 +44,7 @@ class MLXRuntimeConfig:
     turboquant_bits: Optional[int] = None
     turboquant_seed: int = 42
     turboquant_fused: bool = True
+    Sigma_q: Any = None
 
 
 SMAQConfig = MLXRuntimeConfig
