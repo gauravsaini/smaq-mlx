@@ -17,6 +17,8 @@ from smaq_mlx.kv_cache import SMAQKVCache, quantize_values, dequantize_values
 from smaq_mlx.rotor_cache import RotorQuantKVCache
 from smaq_mlx.rotorquant import RotorQuantMSE
 from smaq_mlx.capture import RingBuffer, KVCaptureEngine
+from smaq_mlx.folded_cache import FoldedTurboSMAQKVCache
+from smaq_mlx.folded_turboquant import FoldedTurboQuantizer
 from smaq_mlx.store import CompressedKVStore
 from smaq_mlx.patch import clear_configuration, configure, current_configuration
 
@@ -256,6 +258,32 @@ class TestRotorQuant(unittest.TestCase):
         self.assertGreater(cache.compression_ratio, 1.0)
 
 
+class TestFoldedTurboSMAQ(unittest.TestCase):
+    """Tests for the folded Turbo+SMAQ single-cache path."""
+
+    def test_folded_quantizer_roundtrip_shape(self):
+        quantizer = FoldedTurboQuantizer(dim=64, bits=3, seed=42)
+        mx.random.seed(42)
+        vectors = mx.random.normal((8, 64))
+        packed, norms = quantizer.quantize(vectors)
+        reconstructed = quantizer.dequantize(packed, norms)
+        self.assertEqual(reconstructed.shape, vectors.shape)
+
+    def test_folded_cache_update_fit_and_fetch(self):
+        cache = FoldedTurboSMAQKVCache(bits=3, head_dim=64)
+        mx.random.seed(42)
+        keys = mx.random.normal((1, 4, 8, 64))
+        values = mx.random.normal((1, 4, 8, 64))
+        cache.update_and_fetch(keys, values)
+        queries = mx.random.normal((1, 4, 8, 64))
+        cache.fit_metric_from_queries(queries)
+        returned_k, returned_v = cache.materialize(dtype=mx.float32)
+        self.assertTrue(cache.metric_fitted)
+        self.assertEqual(returned_k.shape, (1, 4, 8, 64))
+        self.assertEqual(returned_v.shape, (1, 4, 8, 64))
+        self.assertGreater(cache.compression_ratio, 1.0)
+
+
 class TestPublicApi(unittest.TestCase):
     """Tests for user-facing public API helpers."""
 
@@ -279,6 +307,7 @@ class TestPublicApi(unittest.TestCase):
 
     def test_available_backends(self):
         names = available_backends()
+        self.assertIn("folded_turbo_smaq", names)
         self.assertIn("polarquant", names)
         self.assertIn("rotorquant", names)
         self.assertIn("smaq", names)
@@ -286,6 +315,7 @@ class TestPublicApi(unittest.TestCase):
         self.assertIn("turboquant", names)
 
     def test_get_backend(self):
+        self.assertEqual(get_backend("folded_turbo_smaq").name, "folded_turbo_smaq")
         self.assertEqual(get_backend("polarquant").name, "polarquant")
         self.assertEqual(get_backend("rotorquant").name, "rotorquant")
         self.assertEqual(get_backend("smaq").name, "smaq")
@@ -295,6 +325,7 @@ class TestPublicApi(unittest.TestCase):
     def test_backend_matrix(self):
         entries = backend_matrix()
         by_name = {entry["name"]: entry for entry in entries}
+        self.assertEqual(by_name["folded_turbo_smaq"]["status"], "research")
         self.assertEqual(by_name["polarquant"]["status"], "experimental")
         self.assertEqual(by_name["rotorquant"]["status"], "experimental")
         self.assertEqual(by_name["polarquant"]["requires_package"], "mlx-turboquant")
@@ -335,6 +366,23 @@ class TestPublicApi(unittest.TestCase):
         self.assertEqual(current["rotorquant_bits"], 3)
         self.assertEqual(current["rotorquant_key_seed"], 21)
         self.assertEqual(current["rotorquant_value_seed"], 22)
+
+    def test_patch_runtime_configuration_supports_folded_backend(self):
+        configure(
+            MLXRuntimeConfig(
+                backend="folded_turbo_smaq",
+                folded_turbo_bits=3,
+                folded_turbo_key_seed=31,
+                folded_turbo_value_seed=32,
+                folded_smaq_c=7.0,
+            )
+        )
+        current = current_configuration()
+        self.assertEqual(current["backend"], "folded_turbo_smaq")
+        self.assertEqual(current["folded_turbo_bits"], 3)
+        self.assertEqual(current["folded_turbo_key_seed"], 31)
+        self.assertEqual(current["folded_turbo_value_seed"], 32)
+        self.assertEqual(current["folded_smaq_c"], 7.0)
 
     def test_validate_backend_accepts_custom_backend(self):
         class DummyBackend(RuntimeBackend):

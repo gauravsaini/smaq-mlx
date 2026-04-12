@@ -17,6 +17,7 @@ from smaq_mlx.api import (
 from smaq_mlx.backends import get_backend, register_backend, validate_backend
 from smaq_mlx.core import CacheCapabilities, IdentityCalibrationProvider, LayoutInfo, StaticCalibrationProvider
 from smaq_mlx.capture import KVCaptureEngine, RingBuffer
+from smaq_mlx.folded_cache import FoldedTurboSMAQKVCache
 from smaq_mlx.layout import GemmaLayoutAdapter, ModelLayoutAdapter, QwenLayoutAdapter, infer_model_layout_adapter
 from smaq_mlx.kv_cache import SMAQKVCache
 from smaq_mlx.quantizer import SMAQQuantized, SMAQQuantizer
@@ -36,6 +37,7 @@ __all__ = [
     "BlockVQQuantized",
     "CacheCapabilities",
     "CompressedKVStore",
+    "FoldedTurboSMAQKVCache",
     "GemmaLayoutAdapter",
     "IdentityCalibrationProvider",
     "KVCaptureEngine",

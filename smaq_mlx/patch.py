@@ -22,6 +22,7 @@ Usage (per-call — create SMAQ caches yourself):
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import asdict, is_dataclass
 from typing import Any, Optional
 
@@ -43,6 +44,7 @@ from smaq_mlx.backends import available_backends, dispatch_sdpa, make_prompt_cac
 # Preserve originals
 _original_make_prompt_cache = getattr(_cache, "make_prompt_cache", None)
 _original_sdpa = getattr(_base, "scaled_dot_product_attention", None)
+_patched_model_sdpas: dict[str, Any] = {}
 _patched = False
 _runtime_config = {
     "enabled": None,
@@ -58,6 +60,10 @@ _runtime_config = {
     "rotorquant_bits": None,
     "rotorquant_key_seed": None,
     "rotorquant_value_seed": None,
+    "folded_turbo_bits": None,
+    "folded_turbo_key_seed": None,
+    "folded_turbo_value_seed": None,
+    "folded_smaq_c": None,
     "turboquant_bits": None,
     "turboquant_seed": None,
     "turboquant_fused": None,
@@ -86,6 +92,10 @@ def _normalize_config(config: Any = None, **overrides) -> dict[str, Any]:
                 "rotorquant_bits",
                 "rotorquant_key_seed",
                 "rotorquant_value_seed",
+                "folded_turbo_bits",
+                "folded_turbo_key_seed",
+                "folded_turbo_value_seed",
+                "folded_smaq_c",
                 "turboquant_bits",
                 "turboquant_seed",
                 "turboquant_fused",
@@ -218,6 +228,10 @@ def _patched_make_prompt_cache(model, max_kv_size=None, **kwargs):
     rotorquant_bits = _resolve_int("rotorquant_bits", "ROTORQUANT_BITS", 3)
     rotorquant_key_seed = _resolve_int("rotorquant_key_seed", "ROTORQUANT_KEY_SEED", 42)
     rotorquant_value_seed = _resolve_int("rotorquant_value_seed", "ROTORQUANT_VALUE_SEED", 43)
+    folded_turbo_bits = _resolve_int("folded_turbo_bits", "FOLDED_TURBO_BITS", 3)
+    folded_turbo_key_seed = _resolve_int("folded_turbo_key_seed", "FOLDED_TURBO_KEY_SEED", 42)
+    folded_turbo_value_seed = _resolve_int("folded_turbo_value_seed", "FOLDED_TURBO_VALUE_SEED", 43)
+    folded_smaq_c = _resolve_float("folded_smaq_c", "FOLDED_SMAQ_C", 5.0)
     turboquant_bits = _resolve_int("turboquant_bits", "TURBOQUANT_BITS", 3)
     turboquant_seed = _resolve_int("turboquant_seed", "TURBOQUANT_SEED", 42)
     turboquant_fused = _resolve_bool("turboquant_fused", "TURBOQUANT_FUSED", True)
@@ -234,6 +248,10 @@ def _patched_make_prompt_cache(model, max_kv_size=None, **kwargs):
         rotorquant_bits=rotorquant_bits,
         rotorquant_key_seed=rotorquant_key_seed,
         rotorquant_value_seed=rotorquant_value_seed,
+        folded_turbo_bits=folded_turbo_bits,
+        folded_turbo_key_seed=folded_turbo_key_seed,
+        folded_turbo_value_seed=folded_turbo_value_seed,
+        folded_smaq_c=folded_smaq_c,
         turboquant_bits=turboquant_bits,
         turboquant_seed=turboquant_seed,
         turboquant_fused=turboquant_fused,
@@ -255,6 +273,10 @@ def _patched_sdpa(queries, keys, values, cache, scale, mask, sinks=None, **kwarg
         "rotorquant_bits": _resolve_int("rotorquant_bits", "ROTORQUANT_BITS", 3),
         "rotorquant_key_seed": _resolve_int("rotorquant_key_seed", "ROTORQUANT_KEY_SEED", 42),
         "rotorquant_value_seed": _resolve_int("rotorquant_value_seed", "ROTORQUANT_VALUE_SEED", 43),
+        "folded_turbo_bits": _resolve_int("folded_turbo_bits", "FOLDED_TURBO_BITS", 3),
+        "folded_turbo_key_seed": _resolve_int("folded_turbo_key_seed", "FOLDED_TURBO_KEY_SEED", 42),
+        "folded_turbo_value_seed": _resolve_int("folded_turbo_value_seed", "FOLDED_TURBO_VALUE_SEED", 43),
+        "folded_smaq_c": _resolve_float("folded_smaq_c", "FOLDED_SMAQ_C", 5.0),
         "turboquant_bits": _resolve_int("turboquant_bits", "TURBOQUANT_BITS", 3),
         "turboquant_seed": _resolve_int("turboquant_seed", "TURBOQUANT_SEED", 42),
         "turboquant_fused": _resolve_bool("turboquant_fused", "TURBOQUANT_FUSED", True),
@@ -278,6 +300,24 @@ def _patched_sdpa(queries, keys, values, cache, scale, mask, sinks=None, **kwarg
     return _original_sdpa(queries, keys, values, cache, scale, mask, sinks=sinks, **kwargs)
 
 
+def _patch_loaded_model_modules():
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("mlx_lm.models.") or module is None:
+            continue
+        if hasattr(module, "scaled_dot_product_attention"):
+            if name not in _patched_model_sdpas:
+                _patched_model_sdpas[name] = getattr(module, "scaled_dot_product_attention")
+            setattr(module, "scaled_dot_product_attention", _patched_sdpa)
+
+
+def _restore_loaded_model_modules():
+    for name, original in list(_patched_model_sdpas.items()):
+        module = sys.modules.get(name)
+        if module is not None:
+            setattr(module, "scaled_dot_product_attention", original)
+    _patched_model_sdpas.clear()
+
+
 def apply(
     config: Any = None,
     *,
@@ -294,6 +334,10 @@ def apply(
     rotorquant_bits: Optional[int] = None,
     rotorquant_key_seed: Optional[int] = None,
     rotorquant_value_seed: Optional[int] = None,
+    folded_turbo_bits: Optional[int] = None,
+    folded_turbo_key_seed: Optional[int] = None,
+    folded_turbo_value_seed: Optional[int] = None,
+    folded_smaq_c: Optional[float] = None,
     turboquant_bits: Optional[int] = None,
     turboquant_seed: Optional[int] = None,
     turboquant_fused: Optional[bool] = None,
@@ -315,6 +359,10 @@ def apply(
         rotorquant_bits=rotorquant_bits,
         rotorquant_key_seed=rotorquant_key_seed,
         rotorquant_value_seed=rotorquant_value_seed,
+        folded_turbo_bits=folded_turbo_bits,
+        folded_turbo_key_seed=folded_turbo_key_seed,
+        folded_turbo_value_seed=folded_turbo_value_seed,
+        folded_smaq_c=folded_smaq_c,
         turboquant_bits=turboquant_bits,
         turboquant_seed=turboquant_seed,
         turboquant_fused=turboquant_fused,
@@ -325,6 +373,7 @@ def apply(
         raise RuntimeError("mlx-lm not installed in current environment")
     _cache.make_prompt_cache = _patched_make_prompt_cache
     _base.scaled_dot_product_attention = _patched_sdpa
+    _patch_loaded_model_modules()
     _patched = True
     # Announce once
     key_bits = _resolve_int("key_bits", "SMAQ_KEY_BITS", 4)
@@ -342,5 +391,6 @@ def revert():
     global _patched
     _cache.make_prompt_cache = _original_make_prompt_cache
     _base.scaled_dot_product_attention = _original_sdpa
+    _restore_loaded_model_modules()
     _patched = False
     clear_configuration()

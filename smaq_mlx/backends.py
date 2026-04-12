@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable
 import mlx.core as mx
 
 from smaq_mlx.attention_smaq import smaq_sdpa
+from smaq_mlx.folded_cache import FoldedTurboSMAQKVCache
 from smaq_mlx.kv_cache import SMAQKVCache
 from smaq_mlx.layout import infer_model_layout_adapter
 from smaq_mlx.rotor_cache import RotorQuantKVCache
@@ -249,6 +250,82 @@ class TurboQuantBackend(RuntimeBackend):
             queries,
             keys,
             values,
+            scale=scale,
+            mask=mask,
+            sinks=sinks,
+        )
+
+
+class FoldedTurboSMAQBackend(RuntimeBackend):
+    def __init__(self):
+        super().__init__(
+            name="folded_turbo_smaq",
+            description="Single-cache TurboQuant-style codec with SMAQ metric folded into key encoding.",
+            status="research",
+        )
+
+    def supports_cache(self, cache: Any) -> bool:
+        return isinstance(cache, FoldedTurboSMAQKVCache)
+
+    def make_prompt_cache(self, model: Any, *, cache_module: Any, config: Dict[str, Any]) -> list[Any]:
+        bits = int(config.get("folded_turbo_bits") or config.get("turboquant_bits") or config.get("key_bits", 3) or 3)
+        key_seed = int(config.get("folded_turbo_key_seed") or config.get("turboquant_seed", 42))
+        value_seed = int(config.get("folded_turbo_value_seed") or (key_seed + 1))
+        smaq_c = float(config.get("folded_smaq_c", 5.0))
+
+        if hasattr(model, "make_cache") and cache_module is not None:
+            original_caches = model.make_cache()
+            result = []
+            for i, c in enumerate(original_caches):
+                if isinstance(c, (cache_module.KVCache, cache_module.RotatingKVCache)):
+                    result.append(
+                        FoldedTurboSMAQKVCache(
+                            bits=bits,
+                            head_dim=_get_head_dim(model, i),
+                            key_seed=key_seed,
+                            value_seed=value_seed,
+                            smaq_c=smaq_c,
+                        )
+                    )
+                else:
+                    result.append(c)
+            return result
+
+        num_layers = len(model.layers)
+        return [
+            FoldedTurboSMAQKVCache(
+                bits=bits,
+                head_dim=_get_head_dim(model, i),
+                key_seed=key_seed,
+                value_seed=value_seed,
+                smaq_c=smaq_c,
+            )
+            for i in range(num_layers)
+        ]
+
+    def sdpa(
+        self,
+        queries: Any,
+        keys: Any,
+        values: Any,
+        cache: Any,
+        *,
+        scale: float,
+        mask: Any,
+        sinks: Any = None,
+        config: Dict[str, Any],
+        original_sdpa: Any = None,
+        **kwargs,
+    ):
+        if not isinstance(cache, FoldedTurboSMAQKVCache):  # pragma: no cover - defensive
+            raise TypeError("Folded Turbo+SMAQ backend received unexpected cache type")
+        if queries.ndim >= 4 and queries.shape[2] > 1 and not cache.metric_fitted:
+            cache.fit_metric_from_queries(queries)
+        cached_keys, cached_values = cache.materialize(dtype=queries.dtype)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            cached_keys,
+            cached_values,
             scale=scale,
             mask=mask,
             sinks=sinks,
@@ -589,6 +666,7 @@ class PlaceholderBackend(RuntimeBackend):
 
 
 _BACKENDS: Dict[str, RuntimeBackend] = {
+    "folded_turbo_smaq": FoldedTurboSMAQBackend(),
     "polarquant": PolarQuantBackend(),
     "rotorquant": RotorQuantBackend(),
     "smaq": SMAQBackend(),
@@ -671,3 +749,74 @@ def dispatch_sdpa(
                 **kwargs,
             )
     return None
+
+class ProgressiveSMAQBackend(RuntimeBackend):
+    def __init__(self):
+        super().__init__(
+            name="progressive",
+            description="Experimental Progressive TQ+SMAQ cascade.",
+            status="research",
+        )
+
+    def supports_cache(self, cache: Any) -> bool:
+        try:
+            from smaq_mlx.progressive_cache import ProgressiveSMAQCache
+            return isinstance(cache, ProgressiveSMAQCache)
+        except ImportError:
+            return False
+
+    def make_prompt_cache(self, model: Any, *, cache_module: Any, config: Dict[str, Any]) -> list[Any]:
+        from smaq_mlx.progressive_cache import ProgressiveSMAQCache
+        key_bits = int(config.get("key_bits", 4))
+        value_bits = int(config.get("value_bits", 4))
+        turboquant_bits = int(config.get("turboquant_bits") or 3)
+        layout_adapter = config.get("layout_adapter") or infer_model_layout_adapter(model)
+        Sigma_q = config.get("Sigma_q")
+        mode = str(config.get("mode", "hybrid"))
+        strict_benchmark = bool(config.get("strict_benchmark", True))
+
+        if hasattr(model, "make_cache") and cache_module is not None:
+            original_caches = model.make_cache()
+            result = []
+            for i, c in enumerate(original_caches):
+                if isinstance(c, (cache_module.KVCache, cache_module.RotatingKVCache)):
+                    head_dim = _get_head_dim(model, i)
+                    result.append(
+                        ProgressiveSMAQCache(
+                            head_dim=head_dim,
+                            key_bits=key_bits,
+                            value_bits=value_bits,
+                            turboquant_bits=turboquant_bits,
+                            layer_idx=i,
+                            layout_adapter=layout_adapter,
+                            mode=mode,
+                            strict_benchmark=strict_benchmark,
+                            Sigma_q=Sigma_q,
+                        )
+                    )
+                else:
+                    result.append(c)
+            return result
+
+        num_layers = len(model.layers)
+        head_dim = _get_head_dim(model, 0)
+        return [
+            ProgressiveSMAQCache(
+                head_dim=head_dim,
+                key_bits=key_bits,
+                value_bits=value_bits,
+                turboquant_bits=turboquant_bits,
+                layer_idx=i,
+                layout_adapter=layout_adapter,
+                mode=mode,
+                strict_benchmark=strict_benchmark,
+                Sigma_q=Sigma_q,
+            )
+            for i in range(num_layers)
+        ]
+
+    def sdpa(self, queries: Any, keys: Any, values: Any, cache: Any, *, scale: float, mask: Any, sinks: Any = None, config: Dict[str, Any], original_sdpa: Any = None, **kwargs):
+        from smaq_mlx.progressive_cache import progressive_sdpa
+        return progressive_sdpa(queries, cache, scale=scale, mask=mask)
+
+_BACKENDS["progressive"] = ProgressiveSMAQBackend()
