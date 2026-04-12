@@ -3,6 +3,9 @@
 Adds a small auto-detect block to mlx_lm/__init__.py that activates
 SMAQ when the SMAQ_ENABLED=1 environment variable is set.
 
+This helper is convenient for local experimentation, but application
+code should prefer the explicit public API in ``smaq_mlx.api``.
+
 Usage:
     python -m smaq_mlx.install          # install the hook
     python -m smaq_mlx.install --revert # remove the hook
@@ -59,10 +62,17 @@ def install():
     print(f"  SMAQ_ENABLED=1 python -m mlx_lm.generate --model <model> --prompt 'hello'")
     print(f"  SMAQ_ENABLED=1 python -m mlx_lm.server --model <model>")
     print(f"")
+    print(f"  Preferred application usage:")
+    print(f"    from smaq_mlx import SMAQConfig, enable_smaq")
+    print(f"    enable_smaq(SMAQConfig(key_bits=4, value_bits=4))")
+    print(f"")
     print(f"  Environment variables:")
     print(f"    SMAQ_ENABLED=1         Enable SMAQ KV cache (required)")
     print(f"    SMAQ_KEY_BITS=4        Key quantization bits (default: 4)")
     print(f"    SMAQ_VALUE_BITS=4      Value quantization bits (default: 4)")
+    print(f"    SMAQ_CACHE_MODE=hybrid Cache mode: shadow|hybrid|true_compressed")
+    print(f"    SMAQ_REQUIRE_TRUE_COMPRESSED=1 Fail if compressed history not used")
+    print(f"    SMAQ_BENCHMARK_STRICT=1 Guardrail for benchmark runs")
 
 
 def revert():

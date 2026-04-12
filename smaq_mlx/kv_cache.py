@@ -19,6 +19,8 @@ from typing import Optional
 
 import mlx.core as mx
 
+from smaq_mlx.core import CacheCapabilities
+from smaq_mlx.layout import ModelLayoutAdapter
 from smaq_mlx.quantizer import SMAQQuantized, SMAQQuantizer
 
 
@@ -113,16 +115,17 @@ def dequantize_values(
 
 
 class SMAQKVCache:
-    """Drop-in KV cache with SMAQ-compressed keys + group-quantized values.
+    """Drop-in KV cache with compressed-history attention.
 
-    Implements the mlx-lm KVCache interface for seamless integration.
+    True compressed path:
+    - historical tokens stored as quantized keys/values
+    - recent tail kept exact in ring buffer
+    - SDPA uses compressed history + exact tail
 
-    Storage strategy:
-    - Full precision keys/values stored for exact attention computation
-    - Quantized versions tracked for memory estimation and future SDPA interception
+    Compatibility path:
+    - optional full-precision shadow cache is still tracked for mlx-lm state
+      and debugging, but benchmark/reporting can ignore it.
     """
-
-    step = 256
 
     def __init__(
         self,
@@ -133,6 +136,9 @@ class SMAQKVCache:
         value_group_size: int = 32,
         buffer_size: int = 128,
         layer_idx: int = 0,
+        layout_adapter: ModelLayoutAdapter | None = None,
+        mode: str = "hybrid",
+        strict_benchmark: bool = False,
     ):
         self.head_dim = head_dim
         self.key_bits = key_bits
@@ -140,30 +146,116 @@ class SMAQKVCache:
         self.value_group_size = value_group_size
         self.buffer_size = buffer_size
         self.layer_idx = layer_idx
+        self.layout_adapter = layout_adapter or ModelLayoutAdapter()
+        self.mode = mode
+        self.strict_benchmark = strict_benchmark
 
-        self.key_quantizer = SMAQQuantizer(
-            dim=head_dim,
-            Sigma_q=Sigma_q,
-            bits=key_bits,
-        )
+        self._sigma_q = Sigma_q
+        self._layout_info = None
+        self.key_quantizer: Optional[SMAQQuantizer] = None
 
-        # mlx-lm interface attributes
         self.offset = 0
         self.seq_len = 0
 
-
-        # Full precision storage (for exact attention)
         self.keys: Optional[mx.array] = None
         self.values: Optional[mx.array] = None
-
-        # Quantized storage (for memory tracking and future SDPA interception)
         self.key_quantized: Optional[SMAQQuantized] = None
         self.value_data: Optional[mx.array] = None
         self.value_scales: Optional[mx.array] = None
         self.value_zeros: Optional[mx.array] = None
-
-        # Linear attention state (for Qwen3.5 hybrid architecture)
+        self.key_buffer: Optional[mx.array] = None
+        self.value_buffer: Optional[mx.array] = None
         self._linear_attn_state: list = [None, None]
+        self._capabilities = self._build_capabilities()
+
+    def _build_capabilities(self) -> CacheCapabilities:
+        compressed = self.mode in ("hybrid", "true_compressed")
+        shadow = self.mode == "shadow"
+        return CacheCapabilities(
+            strategy_name="smaq_mlx_cache",
+            metric_name="smaq_metric",
+            quantization_name="scalar_group",
+            compressed_history=compressed,
+            compressed_history_shadow_only=shadow,
+            values_compressed=True,
+            decode_uses_compressed_keys=compressed,
+            decode_uses_compressed_values=compressed,
+        )
+
+    @property
+    def capabilities(self) -> CacheCapabilities:
+        return self._capabilities
+
+    def report(self) -> dict[str, int | str | bool]:
+        return {
+            "strategy_name": self._capabilities.strategy_name,
+            "metric_name": self._capabilities.metric_name,
+            "quantization_name": self._capabilities.quantization_name,
+            "compressed_history": self._capabilities.compressed_history,
+            "compressed_history_shadow_only": self._capabilities.compressed_history_shadow_only,
+            "values_compressed": self._capabilities.values_compressed,
+            "decode_uses_compressed_keys": self._capabilities.decode_uses_compressed_keys,
+            "decode_uses_compressed_values": self._capabilities.decode_uses_compressed_values,
+            "head_dim": self.head_dim,
+            "buffer_size": self.buffer_size,
+            "offset": self.offset,
+        }
+
+    def _normalize_io(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
+        if keys.ndim == 3:
+            keys = keys[None, ...]
+        if values.ndim == 3:
+            values = values[None, ...]
+        return keys, values
+
+    def _ensure_layout(self, keys: mx.array, values: mx.array):
+        if self._layout_info is not None:
+            return
+        info = self.layout_adapter.normalize_kv(keys, values, expected_head_dim=self.head_dim)
+        self._layout_info = info
+        self.head_dim = info.effective_head_dim
+        if self._sigma_q is None:
+            self._sigma_q = mx.eye(self.head_dim)
+        self.key_quantizer = SMAQQuantizer(
+            dim=self.head_dim,
+            Sigma_q=self._sigma_q,
+            bits=self.key_bits,
+        )
+        self.value_group_size = min(self.value_group_size, values.shape[-1])
+
+    def _append_shadow(self, keys: mx.array, values: mx.array):
+        self.keys = keys if self.keys is None else mx.concatenate([self.keys, keys], axis=-2)
+        self.values = values if self.values is None else mx.concatenate([self.values, values], axis=-2)
+
+    def _append_compressed(self, keys: mx.array, values: mx.array):
+        if self.key_quantizer is None:
+            raise RuntimeError("SMAQKVCache not initialized")
+        key_q = self.key_quantizer.quantize(keys)
+        val_q = quantize_values(values, bits=self.value_bits, group_size=self.value_group_size)
+        if self.key_quantized is None:
+            self.key_quantized = key_q
+            self.value_data = val_q[0]
+            self.value_scales = val_q[1]
+            self.value_zeros = val_q[2]
+            return
+        self.key_quantized = SMAQQuantized(
+            indices=mx.concatenate([self.key_quantized.indices, key_q.indices], axis=-2),
+            norms=mx.concatenate([self.key_quantized.norms, key_q.norms], axis=-1),
+            bits=self.key_quantized.bits,
+        )
+        self.value_data = mx.concatenate([self.value_data, val_q[0]], axis=-2)
+        self.value_scales = mx.concatenate([self.value_scales, val_q[1]], axis=-2)
+        self.value_zeros = mx.concatenate([self.value_zeros, val_q[2]], axis=-2)
+
+    def _flush_buffer_if_needed(self):
+        if self.key_buffer is None or self.key_buffer.shape[-2] <= self.buffer_size:
+            return
+        n_flush = self.key_buffer.shape[-2] - self.buffer_size
+        flush_k = self.key_buffer[..., :n_flush, :]
+        flush_v = self.value_buffer[..., :n_flush, :]
+        self._append_compressed(flush_k, flush_v)
+        self.key_buffer = self.key_buffer[..., n_flush:, :]
+        self.value_buffer = self.value_buffer[..., n_flush:, :]
 
     def __getitem__(self, idx):
         """Support cache[0], cache[1] for linear_attn layers (Qwen3.5)."""
@@ -201,70 +293,21 @@ class SMAQKVCache:
         return "causal"
 
     def update_and_fetch(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
-        """Store KV pairs and return full precision for attention computation.
+        """Store KV pairs and build compressed-history view."""
+        keys, values = self._normalize_io(keys, values)
+        self._ensure_layout(keys, values)
 
-        This is the main interface called by mlx-lm's attention layers.
-        Keys/values are stored in full precision for exact attention,
-        and also quantized for memory tracking.
-        """
-        prev = self.offset
-        num_steps = keys.shape[2]
-        self.offset += num_steps
+        self.offset += keys.shape[-2]
         self.seq_len = self.offset
+        self._append_shadow(keys, values)
 
-        # Store full precision keys/values
-        if self.keys is None:
-            # Pre-allocate with step sizing
-            B, n_kv_heads, _, k_head_dim = keys.shape
-            v_head_dim = values.shape[3]
-            n_steps = (self.step + num_steps - 1) // self.step * self.step
-            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
-            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
-            self.keys = mx.zeros(k_shape, keys.dtype)
-            self.values = mx.zeros(v_shape, values.dtype)
-
-        self.keys[..., prev:self.offset, :] = keys
-        self.values[..., prev:self.offset, :] = values
-
-        # Also quantize for memory tracking
-        # Reshape from (B, n_kv_heads, T, D) to (B * n_kv_heads * T, D) for quantizer
-        k_shape = keys.shape
-        
-        # Support Gemma 4 models which concat Keys and Values creating a double width head_dim (unified KV)
-        if k_shape[-1] != self.head_dim:
-            self.head_dim = k_shape[-1]
-            self.key_quantizer = SMAQQuantizer(
-                dim=self.head_dim,
-                Sigma_q=mx.eye(self.head_dim),
-                bits=self.key_bits,
-            )
-            
-        k_flat = keys.reshape(-1, k_shape[-1])
-        new_key_q = self.key_quantizer.quantize(k_flat)
-        # Reshape indices back to (B, n_kv_heads, T, packed_D)
-        new_key_q = SMAQQuantized(
-            indices=new_key_q.indices.reshape(k_shape[0], k_shape[1], k_shape[2], new_key_q.indices.shape[-1]),
-            norms=new_key_q.norms.reshape(k_shape[0], k_shape[1], k_shape[2]),
-            bits=new_key_q.bits,
-        )
-        new_v_data, new_v_scales, new_v_zeros, _ = quantize_values(
-            values, bits=self.value_bits, group_size=self.value_group_size
-        )
-
-        if self.key_quantized is None:
-            self.key_quantized = new_key_q
-            self.value_data = new_v_data
-            self.value_scales = new_v_scales
-            self.value_zeros = new_v_zeros
+        if self.key_buffer is None:
+            self.key_buffer = keys
+            self.value_buffer = values
         else:
-            self.key_quantized = SMAQQuantized(
-                indices=mx.concatenate([self.key_quantized.indices, new_key_q.indices], axis=-2),
-                norms=mx.concatenate([self.key_quantized.norms, new_key_q.norms], axis=-1),
-                bits=new_key_q.bits,
-            )
-            self.value_data = mx.concatenate([self.value_data, new_v_data], axis=-2)
-            self.value_scales = mx.concatenate([self.value_scales, new_v_scales], axis=-2)
-            self.value_zeros = mx.concatenate([self.value_zeros, new_v_zeros], axis=-2)
+            self.key_buffer = mx.concatenate([self.key_buffer, keys], axis=-2)
+            self.value_buffer = mx.concatenate([self.value_buffer, values], axis=-2)
+        self._flush_buffer_if_needed()
 
         return self.keys[..., :self.offset, :], self.values[..., :self.offset, :]
 
@@ -309,33 +352,109 @@ class SMAQKVCache:
         self.update_and_fetch(key, value)
 
     def attention_scores(self, query: mx.array, scale: Optional[float] = None) -> mx.array:
-        """Compute attention scores against compressed history."""
+        """Compute attention scores against compressed history + recent exact tail."""
         if scale is None:
             scale = 1.0 / math.sqrt(self.head_dim)
-        if self.key_quantized is None:
+        B, n_q_heads, T_q, D = query.shape
+        n_kv_heads = None
+        if self.key_quantized is not None:
+            n_kv_heads = self.key_quantized.indices.shape[1]
+        elif self.key_buffer is not None:
+            n_kv_heads = self.key_buffer.shape[1]
+        else:
+            n_kv_heads = n_q_heads
+        gqa_ratio = max(1, n_q_heads // max(1, n_kv_heads))
+        q_grouped = query.reshape(B, n_kv_heads, gqa_ratio, T_q, D)
+
+        scores = []
+        if self.key_quantized is not None:
+            head_scores = []
+            for head_idx in range(n_kv_heads):
+                key_q = SMAQQuantized(
+                    indices=self.key_quantized.indices[:, head_idx, :, :],
+                    norms=self.key_quantized.norms[:, head_idx, :],
+                    bits=self.key_quantized.bits,
+                )
+                q_head = q_grouped[:, head_idx, :, :, :]
+                head_scores.append(self.key_quantizer.attention_score(q_head, key_q, scale=scale))
+            scores.append(mx.concatenate(head_scores, axis=1))
+        if self.key_buffer is not None:
+            buf_scores = mx.einsum(
+                "bhgtd,bhnd->bhgtn",
+                q_grouped.astype(mx.float32),
+                self.key_buffer.astype(mx.float32),
+            ) * scale
+            scores.append(buf_scores.reshape(B, n_q_heads, T_q, self.key_buffer.shape[-2]))
+        if not scores:
             return mx.zeros((*query.shape[:-1], 0))
-        return self.key_quantizer.attention_score(query, self.key_quantized, scale=scale)
+        return mx.concatenate(scores, axis=-1)
 
     def attend(self, attn_weights: mx.array) -> mx.array:
-        """Apply attention weights to compressed values."""
-        if self.values is None:
-            return mx.zeros((*attn_weights.shape[:-1], self.head_dim))
-        return (attn_weights.astype(mx.float32) @ self.values.astype(mx.float32))
+        """Apply attention weights to compressed values + exact tail."""
+        B, n_q_heads, T_q, _ = attn_weights.shape
+        n_kv_heads = None
+        if self.value_data is not None:
+            n_kv_heads = self.value_data.shape[1]
+        elif self.value_buffer is not None:
+            n_kv_heads = self.value_buffer.shape[1]
+        else:
+            n_kv_heads = n_q_heads
+        gqa_ratio = max(1, n_q_heads // max(1, n_kv_heads))
+        weights_grouped = attn_weights.reshape(B, n_kv_heads, gqa_ratio, T_q, attn_weights.shape[-1])
 
-    def memory_bytes(self) -> dict[str, int]:
-        """Estimate memory usage of the cache."""
-        info = {"quantized_keys": 0, "quantized_values": 0, "total": 0}
+        outputs = []
+        offset = 0
+        if self.value_data is not None:
+            n_quant = self.value_data.shape[-2]
+            w_quant = weights_grouped[..., offset : offset + n_quant]
+            v_dequant = dequantize_values(
+                self.value_data, self.value_scales, self.value_zeros, self.value_bits, self.value_group_size
+            )
+            outputs.append(mx.einsum("bhgtn,bhnd->bhgtd", w_quant.astype(mx.float32), v_dequant.astype(mx.float32)))
+            offset += n_quant
+        if self.value_buffer is not None:
+            n_buf = self.value_buffer.shape[-2]
+            w_buf = weights_grouped[..., offset : offset + n_buf]
+            outputs.append(mx.einsum("bhgtn,bhnd->bhgtd", w_buf.astype(mx.float32), self.value_buffer.astype(mx.float32)))
+        if not outputs:
+            return mx.zeros((*attn_weights.shape[:-1], self.head_dim))
+        out = sum(outputs)
+        return out.reshape(B, n_q_heads, T_q, self.head_dim)
+
+    def memory_bytes(self, include_shadow: bool = False) -> dict[str, int]:
+        """Estimate memory usage of compressed path.
+
+        include_shadow=True adds full-precision compatibility shadow.
+        """
+        info = {
+            "compressed_keys": 0,
+            "compressed_values": 0,
+            "exact_buffer": 0,
+            "shadow": 0,
+            "total": 0,
+        }
 
         if self.key_quantized is not None:
-            info["quantized_keys"] += self.key_quantized.indices.nbytes
-            info["quantized_keys"] += self.key_quantized.norms.nbytes
+            info["compressed_keys"] += self.key_quantized.indices.nbytes
+            info["compressed_keys"] += self.key_quantized.norms.nbytes
 
         if self.value_data is not None:
-            info["quantized_values"] += self.value_data.nbytes
-            info["quantized_values"] += self.value_scales.nbytes
-            info["quantized_values"] += self.value_zeros.nbytes
+            info["compressed_values"] += self.value_data.nbytes
+            info["compressed_values"] += self.value_scales.nbytes
+            info["compressed_values"] += self.value_zeros.nbytes
 
-        info["total"] = info["quantized_keys"] + info["quantized_values"]
+        if self.key_buffer is not None:
+            info["exact_buffer"] += self.key_buffer.nbytes
+        if self.value_buffer is not None:
+            info["exact_buffer"] += self.value_buffer.nbytes
+
+        if include_shadow:
+            if self.keys is not None:
+                info["shadow"] += self.keys.nbytes
+            if self.values is not None:
+                info["shadow"] += self.values.nbytes
+
+        info["total"] = info["compressed_keys"] + info["compressed_values"] + info["exact_buffer"] + info["shadow"]
         return info
 
     @property
@@ -353,10 +472,24 @@ class SMAQKVCache:
         """FP16 equivalent memory for comparison."""
         if self.keys is None:
             return 0
-        # Determine exact FP16 representation of stored sequence
         k_bytes = self.keys[..., :self.offset, :].size * 2
         v_bytes = self.values[..., :self.offset, :].size * 2
         return k_bytes + v_bytes
+
+    def capability_report(self) -> dict[str, int | str | bool]:
+        return {
+            "strategy_name": self.capabilities.strategy_name,
+            "metric_name": self.capabilities.metric_name,
+            "quantization_name": self.capabilities.quantization_name,
+            "compressed_history": self.capabilities.compressed_history,
+            "compressed_history_shadow_only": self.capabilities.compressed_history_shadow_only,
+            "values_compressed": self.capabilities.values_compressed,
+            "decode_uses_compressed_keys": self.capabilities.decode_uses_compressed_keys,
+            "decode_uses_compressed_values": self.capabilities.decode_uses_compressed_values,
+            "layout_adapter": getattr(self._layout_info, "adapter_name", "pending"),
+            "effective_head_dim": getattr(self._layout_info, "effective_head_dim", self.head_dim),
+            "offset": self.offset,
+        }
 
     def get_seq_length(self) -> int:
         return self.offset

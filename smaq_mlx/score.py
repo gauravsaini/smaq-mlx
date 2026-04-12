@@ -26,6 +26,7 @@ def compute_hybrid_attention(
     recent_v: Optional[mx.array],
     num_query_heads: int,
     scale: Optional[float] = None,
+    require_true_compressed: bool = False,
 ) -> mx.array:
     """Compute attention output combining compressed history and exact recent KV."""
     head_dim = store.head_dim
@@ -34,6 +35,8 @@ def compute_hybrid_attention(
         scale = 1.0 / math.sqrt(head_dim)
 
     flat = store.get_flat_cache()
+    if require_true_compressed and (flat is None or not store.capabilities.compressed_history):
+        raise RuntimeError(f"True compressed mode requested but store is not compressed: {store.report()}")
     has_history = flat is not None and flat.num_tokens >= MIN_HISTORY_FOR_SMAQ
     has_recent = recent_k is not None and recent_k.size > 0
 
@@ -43,19 +46,19 @@ def compute_hybrid_attention(
     gqa_ratio = num_query_heads // num_kv_heads
 
     if has_history and not has_recent:
-        hist_scores = _quantized_scores(query, flat, store.quantizer, gqa_ratio, num_kv_heads, scale)
+        hist_scores = _quantized_scores(query, flat, store.quantizer, gqa_ratio, num_kv_heads, num_query_heads, scale)
         hist_values = dequantize_values(
             flat.value_data, flat.value_scales, flat.value_zeros,
             flat.value_bits, store.value_group_size
         )
         weights = mx.softmax(hist_scores, axis=-1)
-        return _apply_weights(weights, hist_values, gqa_ratio, num_kv_heads)
+        return _apply_weights(weights, hist_values, gqa_ratio, num_kv_heads, num_query_heads)
 
     if not has_history and has_recent:
         return _attend_exact_only(query, recent_k, recent_v, gqa_ratio, num_kv_heads, scale)
 
-    hist_scores = _quantized_scores(query, flat, store.quantizer, gqa_ratio, num_kv_heads, scale)
-    recent_scores = _exact_scores(query, recent_k, gqa_ratio, num_kv_heads, scale)
+    hist_scores = _quantized_scores(query, flat, store.quantizer, gqa_ratio, num_kv_heads, num_query_heads, scale)
+    recent_scores = _exact_scores(query, recent_k, gqa_ratio, num_kv_heads, num_query_heads, scale)
     logits = mx.concatenate([hist_scores, recent_scores], axis=-1)
     weights = mx.softmax(logits, axis=-1)
 
@@ -65,8 +68,8 @@ def compute_hybrid_attention(
         flat.value_bits, store.value_group_size
     )
 
-    out_hist = _apply_weights(weights[..., :hist_len], hist_values, gqa_ratio, num_kv_heads)
-    out_recent = _apply_weights(weights[..., hist_len:], recent_v, gqa_ratio, num_kv_heads)
+    out_hist = _apply_weights(weights[..., :hist_len], hist_values, gqa_ratio, num_kv_heads, num_query_heads)
+    out_recent = _apply_weights(weights[..., hist_len:], recent_v.transpose(0, 1), gqa_ratio, num_kv_heads, num_query_heads)
     return out_hist + out_recent
 
 
@@ -76,6 +79,7 @@ def _quantized_scores(
     quantizer: SMAQQuantizer,
     gqa_ratio: int,
     num_kv_heads: int,
+    num_query_heads: int,
     scale: float,
 ) -> mx.array:
     """Compute logits against SMAQ-compressed historical keys."""
@@ -101,12 +105,13 @@ def _exact_scores(
     recent_k: mx.array,
     gqa_ratio: int,
     num_kv_heads: int,
+    num_query_heads: int,
     scale: float,
 ) -> mx.array:
     """Compute exact logits against the recent ring buffer."""
     B, D = query.shape[0], query.shape[-1]
     q = query.reshape(B, num_kv_heads, gqa_ratio, D)
-    k = recent_k.transpose(0, 2, 1)[None, :, :, :]
+    k = recent_k.transpose(1, 0, 2)[None, :, :, :]
 
     scores = (q.astype(mx.float32) @ k.astype(mx.float32)) * scale
     return scores.reshape(B, num_query_heads, recent_k.shape[-2])
@@ -117,13 +122,14 @@ def _apply_weights(
     values: mx.array,
     gqa_ratio: int,
     num_kv_heads: int,
+    num_query_heads: int,
 ) -> mx.array:
     """Apply attention weights to either compressed-history or exact values."""
     B = weights.shape[0]
     v = values[None, :, :, :]
     w = weights.reshape(B, num_kv_heads, gqa_ratio, weights.shape[-1])
     out = (w.astype(mx.float32) @ v.astype(mx.float32))
-    return out.reshape(B, num_kv_heads * gqa_ratio, values.shape[-1])
+    return out.reshape(B, num_query_heads, values.shape[-1])
 
 
 def _attend_exact_only(
@@ -135,6 +141,7 @@ def _attend_exact_only(
     scale: float,
 ) -> mx.array:
     """Exact attention over the recent ring buffer only."""
-    scores = _exact_scores(query, recent_k, gqa_ratio, num_kv_heads, scale)
+    num_query_heads = num_kv_heads * gqa_ratio
+    scores = _exact_scores(query, recent_k, gqa_ratio, num_kv_heads, num_query_heads, scale)
     weights = mx.softmax(scores, axis=-1)
-    return _apply_weights(weights, recent_v, gqa_ratio, num_kv_heads)
+    return _apply_weights(weights, recent_v.transpose(0, 1), gqa_ratio, num_kv_heads, num_query_heads)

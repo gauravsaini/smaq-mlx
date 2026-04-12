@@ -41,8 +41,12 @@ pip install mlx mlx-lm
 
 # Install SMAQ-MLX
 pip install -e .
+python -m smaq_mlx.install  # Post-install hook for transparent support
 
-# Demo: text generation with SMAQ KV cache
+# Running with SMAQ enabled:
+SMAQ_ENABLED=1 python -m mlx_lm.generate --model <path> --prompt "Hello"
+
+# Demo: interactive text generation
 python run_llm.py
 
 # Benchmark: speed + quality
@@ -53,8 +57,8 @@ python benchmark.py
 
 ```python
 import mlx_lm
-from smaq.kv_cache import SMAQKVCache
-from smaq.patch import apply as smaq_patch_apply
+from smaq_mlx.kv_cache import SMAQKVCache
+from smaq_mlx.patch import apply as smaq_patch_apply
 
 smaq_patch_apply()  # Monkey-patch SDPA dispatch
 
@@ -97,7 +101,7 @@ output = mlx_lm.generate(model, tokenizer, prompt="Hello", max_tokens=100, kv_ca
 │    → Routes to SMAQ attention               │
 ├─────────────────────────────────────────────┤
 │                                             │
-│  smaq/                                      │
+│  smaq_mlx/                                 │
 │  ├── ssf.py          # Spectral shaping     │
 │  ├── block_vq.py     # Block VQ quantizer   │
 │  ├── quantizer.py    # Scalar quantizer     │
@@ -105,8 +109,9 @@ output = mlx_lm.generate(model, tokenizer, prompt="Hello", max_tokens=100, kv_ca
 │  ├── capture.py      # Ring buffer          │
 │  ├── store.py        # Compressed store     │
 │  ├── score.py        # Hybrid attention     │
-│  ├── attention_smaq.py # SMAQ SDPA         │
-│  └── patch.py        # mlx-lm integration   │
+│  ├── attention_smaq.py # SMAQ SDPA          │
+│  ├── patch.py        # mlx-lm integration   │
+│  └── install.py      # Installation hook    │
 │                                             │
 ├─────────────────────────────────────────────┤
 │  MLX Metal Backend                          │
@@ -133,7 +138,7 @@ output = mlx_lm.generate(model, tokenizer, prompt="Hello", max_tokens=100, kv_ca
 
 ```
 smaq-mlx/
-├── smaq/
+├── smaq_mlx/
 │   ├── __init__.py
 │   ├── ssf.py                 # Log-compressed spectral shaping
 │   ├── block_vq.py            # Block VQ quantizer (paper experiments)
@@ -143,7 +148,8 @@ smaq-mlx/
 │   ├── store.py               # Chunked compressed KV store
 │   ├── score.py               # Hybrid attention: compressed + exact
 │   ├── attention_smaq.py      # SMAQ SDPA implementation
-│   └── patch.py               # Monkey-patch for mlx-lm SDPA dispatch
+│   ├── patch.py               # Monkey-patch for mlx-lm SDPA dispatch
+│   └── install.py             # Transparent installation hook
 ├── tests/
 │   └── test_smaq.py           # Unit tests
 ├── benchmark.py               # Speed + quality benchmark

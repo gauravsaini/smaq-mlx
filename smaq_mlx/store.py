@@ -10,6 +10,7 @@ from typing import NamedTuple, Optional
 
 import mlx.core as mx
 
+from smaq_mlx.core import CacheCapabilities
 from smaq_mlx.kv_cache import quantize_values, dequantize_values
 from smaq_mlx.quantizer import SMAQQuantized, SMAQQuantizer
 
@@ -57,6 +58,16 @@ class CompressedKVStore:
         self._value_zeros_chunks: list[mx.array] = []
         self._chunk_lengths: list[int] = []
         self._flat: Optional[FlatCache] = None
+        self._capabilities = CacheCapabilities(
+            strategy_name="smaq_store",
+            metric_name="smaq_metric",
+            quantization_name="scalar_group",
+            compressed_history=True,
+            compressed_history_shadow_only=False,
+            values_compressed=True,
+            decode_uses_compressed_keys=True,
+            decode_uses_compressed_values=True,
+        )
 
     @property
     def num_tokens(self) -> int:
@@ -121,6 +132,24 @@ class CompressedKVStore:
             num_tokens=self.num_tokens,
         )
         return self._flat
+
+    @property
+    def capabilities(self) -> CacheCapabilities:
+        return self._capabilities
+
+    def report(self) -> dict[str, int | str | bool]:
+        return {
+            "strategy_name": self._capabilities.strategy_name,
+            "metric_name": self._capabilities.metric_name,
+            "quantization_name": self._capabilities.quantization_name,
+            "compressed_history": self._capabilities.compressed_history,
+            "compressed_history_shadow_only": self._capabilities.compressed_history_shadow_only,
+            "values_compressed": self._capabilities.values_compressed,
+            "decode_uses_compressed_keys": self._capabilities.decode_uses_compressed_keys,
+            "decode_uses_compressed_values": self._capabilities.decode_uses_compressed_values,
+            "num_tokens": self.num_tokens,
+            "num_chunks": self.num_chunks,
+        }
 
     def memory_bytes(self) -> int:
         total = 0

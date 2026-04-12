@@ -7,10 +7,15 @@ import numpy as np
 
 from smaq_mlx.ssf import ssf_log, build_smaq_metric
 from smaq_mlx.block_vq import SMAQBlockVQ, BlockVQQuantized
+from smaq_mlx.core import CacheCapabilities
+from smaq_mlx.layout import GemmaLayoutAdapter, QwenLayoutAdapter
+from smaq_mlx.attention_smaq import smaq_sdpa
+from smaq_mlx.api import SMAQConfig
 from smaq_mlx.quantizer import SMAQQuantizer, SMAQQuantized
 from smaq_mlx.kv_cache import SMAQKVCache, quantize_values, dequantize_values
 from smaq_mlx.capture import RingBuffer, KVCaptureEngine
 from smaq_mlx.store import CompressedKVStore
+from smaq_mlx.patch import clear_configuration, configure, current_configuration
 
 
 class TestSSF(unittest.TestCase):
@@ -224,6 +229,26 @@ class TestKVCache(unittest.TestCase):
         reconstructed = dequantize_values(data, scales, zeros, bits, group_size=32)
         self.assertEqual(reconstructed.shape, v.shape)
 
+
+class TestPublicApi(unittest.TestCase):
+    """Tests for user-facing public API helpers."""
+
+    def tearDown(self):
+        clear_configuration()
+
+    def test_smaq_config_defaults(self):
+        config = SMAQConfig()
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.key_bits, 4)
+        self.assertEqual(config.value_bits, 4)
+
+    def test_patch_runtime_configuration(self):
+        configure(SMAQConfig(key_bits=3, value_bits=2, strict_benchmark=True))
+        current = current_configuration()
+        self.assertEqual(current["key_bits"], 3)
+        self.assertEqual(current["value_bits"], 2)
+        self.assertTrue(current["strict_benchmark"])
+
     def test_quantize_values_4bit(self):
         mx.random.seed(42)
         v = mx.random.normal((1, 4, 64, 64))
@@ -303,6 +328,100 @@ class TestCompressedKVStore(unittest.TestCase):
         store.reset()
         self.assertEqual(store.num_tokens, 0)
         self.assertIsNone(store.get_flat_cache())
+
+
+class TestGenericMlxCore(unittest.TestCase):
+    """Tests for generic cache metadata and compressed SDPA path."""
+
+    def test_capability_report(self):
+        cache = SMAQKVCache(head_dim=64, key_bits=3, value_bits=2, mode="hybrid")
+        report = cache.capability_report()
+        self.assertTrue(report["compressed_history"])
+        self.assertFalse(report["compressed_history_shadow_only"])
+        self.assertEqual(report["strategy_name"], "smaq_mlx_cache")
+
+    def test_layout_adapters(self):
+        qwen = QwenLayoutAdapter()
+        gemma = GemmaLayoutAdapter()
+        keys_q = mx.random.normal((1, 4, 8, 8))
+        values_q = mx.random.normal((1, 4, 8, 8))
+        keys_g = mx.random.normal((1, 4, 8, 16))
+        values_g = mx.random.normal((1, 4, 8, 16))
+
+        qwen_info = qwen.normalize_kv(keys_q, values_q, expected_head_dim=8)
+        gemma_info = gemma.normalize_kv(keys_g, values_g, expected_head_dim=8)
+
+        self.assertFalse(qwen_info.unified_kv)
+        self.assertTrue(gemma_info.unified_kv)
+        self.assertEqual(gemma_info.effective_head_dim, 16)
+
+    def test_cache_layout_configures_on_first_update(self):
+        cache = SMAQKVCache(head_dim=8, key_bits=3, value_bits=2, layout_adapter=GemmaLayoutAdapter())
+        keys = mx.random.normal((1, 4, 8, 16))
+        values = mx.random.normal((1, 4, 8, 16))
+        cache.update_and_fetch(keys, values)
+
+        self.assertEqual(cache.head_dim, 16)
+        self.assertIsNotNone(cache.key_quantizer)
+        self.assertEqual(cache.capabilities.decode_uses_compressed_keys, True)
+
+    def test_true_compressed_sdpa_uses_cache_methods(self):
+        class DummyCache:
+            def __init__(self):
+                self.capabilities = CacheCapabilities(
+                    strategy_name="dummy",
+                    metric_name="metric",
+                    quantization_name="quant",
+                    compressed_history=True,
+                    compressed_history_shadow_only=False,
+                    values_compressed=True,
+                    decode_uses_compressed_keys=True,
+                    decode_uses_compressed_values=True,
+                )
+                self._scores = None
+                self.key_quantized = object()
+
+            def attention_scores(self, query, scale=None):
+                self._scores = query
+                return mx.ones((query.shape[0], query.shape[1], query.shape[2], 4))
+
+            def attend(self, attn_weights):
+                return mx.ones((attn_weights.shape[0], attn_weights.shape[1], attn_weights.shape[2], 8))
+
+            def report(self):
+                return {"mode": "compressed"}
+
+        cache = DummyCache()
+        queries = mx.random.normal((1, 2, 3, 8))
+        out = smaq_sdpa(queries, cache, scale=1.0, require_true_compressed=True)
+        self.assertEqual(out.shape, (1, 2, 3, 8))
+        self.assertIsNotNone(cache._scores)
+
+    def test_true_compressed_guard_raises_for_shadow_cache(self):
+        class ShadowCache:
+            def __init__(self):
+                self.capabilities = CacheCapabilities(
+                    strategy_name="shadow",
+                    metric_name="metric",
+                    quantization_name="quant",
+                    compressed_history=False,
+                    compressed_history_shadow_only=True,
+                    values_compressed=False,
+                    decode_uses_compressed_keys=False,
+                    decode_uses_compressed_values=False,
+                )
+
+            def attention_scores(self, query, scale=None):
+                return mx.ones((query.shape[0], query.shape[1], query.shape[2], 4))
+
+            def attend(self, attn_weights):
+                return mx.ones((attn_weights.shape[0], attn_weights.shape[1], attn_weights.shape[2], 8))
+
+            def report(self):
+                return {"mode": "shadow"}
+
+        with self.assertRaises(RuntimeError):
+            smaq_sdpa(mx.random.normal((1, 2, 3, 8)), ShadowCache(), scale=1.0, require_true_compressed=True)
 
 
 if __name__ == "__main__":

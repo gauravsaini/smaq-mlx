@@ -143,8 +143,23 @@ class SMAQQuantizer:
         query_rot = self.rotate_query(query)
         indices = _unpack_indices(quantized_key.indices, quantized_key.bits, self.dim)
         y_hat = self.centroids[indices]
-        scores = (query_rot.astype(mx.float32) @ y_hat.astype(mx.float32).T)
-        scores = scores * quantized_key.norms[..., None, :]
+
+        qf = query_rot.astype(mx.float32)
+        kf = y_hat.astype(mx.float32)
+
+        if qf.ndim == 2 and kf.ndim == 2:
+            scores = qf @ kf.T
+            scores = scores * quantized_key.norms[None, :]
+        elif qf.ndim == 4 and kf.ndim == 3:
+            scores = mx.einsum("bgtd,bnd->bgtn", qf, kf)
+            scores = scores * quantized_key.norms[:, None, None, :]
+        elif qf.ndim == 4 and kf.ndim == 4:
+            scores = mx.einsum("bhtd,bhnd->bhtn", qf, kf)
+            scores = scores * quantized_key.norms[:, :, None, :]
+        else:
+            raise ValueError(
+                f"Unsupported attention_score shapes: query={query.shape}, indices={quantized_key.indices.shape}"
+            )
 
         if scale is not None:
             scores = scores * scale

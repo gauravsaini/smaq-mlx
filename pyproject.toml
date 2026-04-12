@@ -14,5 +14,8 @@ dependencies = [
     "mlx-lm>=0.20.0",
 ]
 
+[project.scripts]
+smaq-mlx-install = "smaq_mlx.install:main"
+
 [tool.setuptools.packages.find]
 include = ["smaq_mlx*"]
