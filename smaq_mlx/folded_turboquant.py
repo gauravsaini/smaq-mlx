@@ -109,13 +109,37 @@ class FoldedTurboQuantizer:
 
     def set_metric(self, Sigma_q: Optional[mx.array]):
         if Sigma_q is None:
-            self.E = mx.eye(self.dim, dtype=mx.float32)
-            self.E_inv = mx.eye(self.dim, dtype=mx.float32)
+            self.diag_scale = mx.ones((self.dim,), dtype=mx.float32)
             self.metric_fitted = False
         else:
-            self.E, self.E_inv = build_smaq_metric(Sigma_q.astype(mx.float32), c=self.c)
+            # 1. Generate explicit randomized Hadamard matrix
+            I = mx.eye(self.dim, dtype=mx.float32)
+            # Each column of I is a basis vector. Let's transform them.
+            # randomized_hadamard expects (batch, dim). I is (dim, dim)
+            H_matrix = randomized_hadamard_transform(I, self.signs)
+            
+            # 2. Rotate the offline covariance
+            Sigma_q = Sigma_q.astype(mx.float32)
+            # Sigma_rot = H * Sigma_q * H.T
+            Sigma_rot = H_matrix @ Sigma_q @ H_matrix.T
+            
+            # 3. Extract diagonal (variances in the rotated space)
+            V = mx.diag(Sigma_rot)
+            
+            # 4. Log-compression scaling on the diagonals (c is compression factor)
+            w = mx.log(1.0 + self.c * mx.maximum(V, 0.0))
+            
+            # 5. Volume preserving normalization
+            # To avoid numerical issues, compute mean of log(w)
+            log_w = mx.log(mx.maximum(w, 1e-8))
+            mean_log_w = mx.mean(log_w)
+            normalized_w = mx.exp(log_w - mean_log_w)
+            
+            # The scale factor is the square root of the shaped density
+            self.diag_scale = mx.sqrt(normalized_w)
             self.metric_fitted = True
-        mx.eval(self.E, self.E_inv, self.signs, self.centroids, self.boundaries)
+            
+        mx.eval(self.diag_scale, self.signs, self.centroids, self.boundaries)
 
     def fit(self, calibration_queries: mx.array):
         q = calibration_queries.astype(mx.float32).reshape(-1, self.dim)
@@ -128,10 +152,18 @@ class FoldedTurboQuantizer:
         norms = mx.linalg.norm(x, axis=-1)
         safe_norms = mx.maximum(norms, 1e-8)
         x_unit = x / safe_norms[..., None]
-        x_shaped = x_unit @ self.E.T
-        x_rot = randomized_hadamard_transform(x_shaped, self.signs)
-        x_scaled = x_rot / self.scale
+        
+        # 1. Hadamard Rotation standard
+        x_rot = randomized_hadamard_transform(x_unit, self.signs)
+        
+        # 2. Weaker Folded Variant: Diagonal scaling
+        # Stretch/compress the values according to importance
+        x_shaped = x_rot * self.diag_scale
+        
+        # 3. Scale back for fixed Gaussian scalar bounds
+        x_scaled = x_shaped / self.scale
 
+        # Broadcast boundaries if necessary for per-dim logic
         indices = mx.zeros(x_scaled.shape, dtype=mx.uint8)
         for boundary in self.boundaries.tolist():
             indices = indices + (x_scaled > boundary).astype(mx.uint8)
@@ -142,6 +174,11 @@ class FoldedTurboQuantizer:
         indices = _unpack_indices(packed, self.bits, self.dim).astype(mx.int32)
         y_hat = self.centroids[indices]
         y_hat = y_hat * self.scale
-        x_shaped_hat = inverse_randomized_hadamard(y_hat, self.signs)
-        x_unit_hat = x_shaped_hat @ self.E_inv.T
+        
+        # Inverse Diagonal scale
+        x_shaped_hat = y_hat / self.diag_scale
+        
+        # Inverse Hadamard
+        x_unit_hat = inverse_randomized_hadamard(x_shaped_hat, self.signs)
+        
         return (x_unit_hat * norms[..., None]).astype(mx.float32)
