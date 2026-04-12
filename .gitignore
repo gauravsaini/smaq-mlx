@@ -1,0 +1,4 @@
+*pycache*
+.DS_Store
+.venv
+smaq/*pycache*
