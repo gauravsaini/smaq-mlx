@@ -224,8 +224,13 @@ class SMAQKVCache:
         self.value_group_size = min(self.value_group_size, values.shape[-1])
 
     def _append_shadow(self, keys: mx.array, values: mx.array):
-        self.keys = keys if self.keys is None else mx.concatenate([self.keys, keys], axis=-2)
-        self.values = values if self.values is None else mx.concatenate([self.values, values], axis=-2)
+        """Legacy shadow append — now a no-op.
+
+        The shadow cache was the root cause of the memory leak: it grew
+        at full FP16 rate alongside the compressed store, tripling memory.
+        KV reconstruction now happens on-demand from compressed + buffer.
+        """
+        pass
 
     def _append_compressed(self, keys: mx.array, values: mx.array):
         if self.key_quantizer is None:
@@ -292,6 +297,38 @@ class SMAQKVCache:
             return _create_causal_mask(N, self.offset, window_size=window_size)
         return "causal"
 
+    def _reconstruct_kv(self) -> tuple[mx.array, mx.array]:
+        """Reconstruct full KV arrays from compressed history + exact buffer.
+
+        This replaces the old shadow cache approach. Instead of keeping a
+        separate full-precision copy (which was the memory leak), we
+        reconstruct on demand from the already-stored compressed data.
+        """
+        parts_k = []
+        parts_v = []
+
+        # Compressed history
+        if self.key_quantized is not None:
+            k_hat = self.key_quantizer.dequantize(self.key_quantized)
+            v_hat = dequantize_values(
+                self.value_data, self.value_scales, self.value_zeros,
+                self.value_bits, self.value_group_size,
+            )
+            parts_k.append(k_hat)
+            parts_v.append(v_hat)
+
+        # Exact buffer tail
+        if self.key_buffer is not None:
+            parts_k.append(self.key_buffer)
+            parts_v.append(self.value_buffer)
+
+        if not parts_k:
+            return None, None
+
+        keys = mx.concatenate(parts_k, axis=-2) if len(parts_k) > 1 else parts_k[0]
+        values = mx.concatenate(parts_v, axis=-2) if len(parts_v) > 1 else parts_v[0]
+        return keys, values
+
     def update_and_fetch(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
         """Store KV pairs and build compressed-history view."""
         keys, values = self._normalize_io(keys, values)
@@ -299,7 +336,6 @@ class SMAQKVCache:
 
         self.offset += keys.shape[-2]
         self.seq_len = self.offset
-        self._append_shadow(keys, values)
 
         if self.key_buffer is None:
             self.key_buffer = keys
@@ -309,12 +345,15 @@ class SMAQKVCache:
             self.value_buffer = mx.concatenate([self.value_buffer, values], axis=-2)
         self._flush_buffer_if_needed()
 
-        return self.keys[..., :self.offset, :], self.values[..., :self.offset, :]
+        # Reconstruct full KV from compressed + buffer (no shadow)
+        rec_k, rec_v = self._reconstruct_kv()
+        return rec_k, rec_v
 
     @property
     def state(self):
         """Return state for mlx-lm compatibility."""
-        return [self.keys, self.values] if self.keys is not None else []
+        k, v = self._reconstruct_kv()
+        return [k, v] if k is not None else []
 
     @state.setter
     def state(self, v):
@@ -332,16 +371,53 @@ class SMAQKVCache:
         return True
 
     def trim(self, n):
+        """Trim n tokens from the end of the cache.
+
+        Properly trims compressed history and/or exact buffer.
+        """
         n = min(self.offset, n)
+        if n == 0:
+            return 0
+
         self.offset -= n
         self.seq_len = self.offset
-        if self.keys is not None:
-            self.keys = self.keys[..., :self.offset + (self.keys.shape[2] - self.offset), :]
-            self.values = self.values[..., :self.offset + (self.values.shape[2] - self.offset), :]
+        remaining_to_trim = n
+
+        # Trim from buffer first (most recent tokens)
+        if self.key_buffer is not None:
+            buf_len = self.key_buffer.shape[-2]
+            trim_from_buf = min(remaining_to_trim, buf_len)
+            if trim_from_buf == buf_len:
+                self.key_buffer = None
+                self.value_buffer = None
+            else:
+                self.key_buffer = self.key_buffer[..., :buf_len - trim_from_buf, :]
+                self.value_buffer = self.value_buffer[..., :buf_len - trim_from_buf, :]
+            remaining_to_trim -= trim_from_buf
+
+        # If we still need to trim, trim from compressed history
+        if remaining_to_trim > 0 and self.key_quantized is not None:
+            comp_len = self.key_quantized.indices.shape[-2]
+            new_comp_len = max(0, comp_len - remaining_to_trim)
+            if new_comp_len == 0:
+                self.key_quantized = None
+                self.value_data = None
+                self.value_scales = None
+                self.value_zeros = None
+            else:
+                self.key_quantized = SMAQQuantized(
+                    indices=self.key_quantized.indices[..., :new_comp_len, :],
+                    norms=self.key_quantized.norms[..., :new_comp_len],
+                    bits=self.key_quantized.bits,
+                )
+                self.value_data = self.value_data[..., :new_comp_len, :]
+                self.value_scales = self.value_scales[..., :new_comp_len, :]
+                self.value_zeros = self.value_zeros[..., :new_comp_len, :]
+
         return n
 
     def empty(self):
-        return self.keys is None
+        return self.key_buffer is None and self.key_quantized is None
 
     def prefill(self, keys: mx.array, values: mx.array):
         """Capture a full prefill segment (legacy interface)."""
@@ -448,33 +524,32 @@ class SMAQKVCache:
         if self.value_buffer is not None:
             info["exact_buffer"] += self.value_buffer.nbytes
 
-        if include_shadow:
-            if self.keys is not None:
-                info["shadow"] += self.keys.nbytes
-            if self.values is not None:
-                info["shadow"] += self.values.nbytes
-
-        info["total"] = info["compressed_keys"] + info["compressed_values"] + info["exact_buffer"] + info["shadow"]
+        info["total"] = info["compressed_keys"] + info["compressed_values"] + info["exact_buffer"]
         return info
 
     @property
     def nbytes(self):
         """Memory usage in bytes (for compatibility with mlx-lm)."""
-        total = 0
-        if self.keys is not None:
-            total += self.keys[..., :self.offset, :].nbytes
-        if self.values is not None:
-            total += self.values[..., :self.offset, :].nbytes
-        return total
+        return self.memory_bytes()["total"]
 
     @property
     def nbytes_equivalent_fp16(self):
-        """FP16 equivalent memory for comparison."""
-        if self.keys is None:
+        """FP16 equivalent memory for comparison (what the uncompressed KV would cost)."""
+        if self.offset == 0:
             return 0
-        k_bytes = self.keys[..., :self.offset, :].size * 2
-        v_bytes = self.values[..., :self.offset, :].size * 2
-        return k_bytes + v_bytes
+        # Estimate from compressed + buffer token counts
+        n_tokens = self.offset
+        # Infer n_kv_heads from buffer or compressed store
+        n_kv_heads = 1
+        bsz = 1
+        if self.key_buffer is not None:
+            bsz = self.key_buffer.shape[0] if self.key_buffer.ndim >= 4 else 1
+            n_kv_heads = self.key_buffer.shape[-3]
+        elif self.key_quantized is not None:
+            bsz = self.key_quantized.indices.shape[0] if self.key_quantized.indices.ndim >= 4 else 1
+            n_kv_heads = self.key_quantized.indices.shape[-3]
+        # FP16 = 2 bytes per element, keys + values
+        return bsz * n_kv_heads * n_tokens * self.head_dim * 2 * 2
 
     def capability_report(self) -> dict[str, int | str | bool]:
         return {
