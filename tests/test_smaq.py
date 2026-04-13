@@ -262,9 +262,9 @@ class TestFoldedTurboSMAQ(unittest.TestCase):
     """Tests for the folded Turbo+SMAQ single-cache path."""
 
     def test_folded_quantizer_roundtrip_shape(self):
-        quantizer = FoldedTurboQuantizer(dim=64, bits=3, seed=42)
+        quantizer = FoldedTurboQuantizer(dim=64, bits=3, seed=42, n_kv_heads=4)
         mx.random.seed(42)
-        vectors = mx.random.normal((8, 64))
+        vectors = mx.random.normal((1, 4, 8, 64))
         packed, norms = quantizer.quantize(vectors)
         reconstructed = quantizer.dequantize(packed, norms)
         self.assertEqual(reconstructed.shape, vectors.shape)

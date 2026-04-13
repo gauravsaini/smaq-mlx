@@ -69,7 +69,7 @@ def compute_hybrid_attention(
     )
 
     out_hist = _apply_weights(weights[..., :hist_len], hist_values, gqa_ratio, num_kv_heads, num_query_heads)
-    out_recent = _apply_weights(weights[..., hist_len:], recent_v.transpose(0, 1), gqa_ratio, num_kv_heads, num_query_heads)
+    out_recent = _apply_weights(weights[..., hist_len:], recent_v, gqa_ratio, num_kv_heads, num_query_heads)
     return out_hist + out_recent
 
 
@@ -111,10 +111,15 @@ def _exact_scores(
     """Compute exact logits against the recent ring buffer."""
     B, D = query.shape[0], query.shape[-1]
     q = query.reshape(B, num_kv_heads, gqa_ratio, D)
-    k = recent_k.transpose(1, 0, 2)[None, :, :, :]
+    
+    if recent_k.ndim == 3:
+        k = recent_k[None, ...]
+    else:
+        k = recent_k
 
-    scores = (q.astype(mx.float32) @ k.astype(mx.float32)) * scale
-    return scores.reshape(B, num_query_heads, recent_k.shape[-2])
+    # q: (B, H, gqa_ratio, D), k: (B, H, T, D) -> (B, H, gqa_ratio, T)
+    scores = (q.astype(mx.float32) @ k.transpose(0, 1, 3, 2).astype(mx.float32)) * scale
+    return scores.reshape(B, num_query_heads, -1)
 
 
 def _apply_weights(
@@ -126,8 +131,15 @@ def _apply_weights(
 ) -> mx.array:
     """Apply attention weights to either compressed-history or exact values."""
     B = weights.shape[0]
-    v = values[None, :, :, :]
+    
+    if values.ndim == 3:
+        v = values[None, ...]
+    else:
+        v = values
+
+    # weights: (B, num_query_heads, T)
     w = weights.reshape(B, num_kv_heads, gqa_ratio, weights.shape[-1])
+    # v: (B, H, T, D)
     out = (w.astype(mx.float32) @ v.astype(mx.float32))
     return out.reshape(B, num_query_heads, values.shape[-1])
 
@@ -144,4 +156,4 @@ def _attend_exact_only(
     num_query_heads = num_kv_heads * gqa_ratio
     scores = _exact_scores(query, recent_k, gqa_ratio, num_kv_heads, num_query_heads, scale)
     weights = mx.softmax(scores, axis=-1)
-    return _apply_weights(weights, recent_v.transpose(0, 1), gqa_ratio, num_kv_heads, num_query_heads)
+    return _apply_weights(weights, recent_v, gqa_ratio, num_kv_heads, num_query_heads)
